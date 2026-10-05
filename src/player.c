@@ -28,6 +28,38 @@ static int cmd_play = -1;       // order position to start
 static int64_t cmd_seek = -1;   // absolute source frame
 static player_status st;
 
+// ---- MP3 seek index, built on a worker thread (guarded by m) ----
+// Seeking an MP3 needs a table of frame offsets, and building it (and, for
+// files without a Xing header, counting the length) reads the whole file.
+// The worker does that while the track plays; the audio thread picks the
+// result up between buffers. A seek before it's ready builds one inline.
+static uint32_t open_id;          // bumped on every decoder_open (audio thread)
+static char ix_path[1024];
+static uint32_t ix_req_id;        // 0 = no request
+static void *ix_result;
+static uint64_t ix_total;
+static uint32_t ix_result_id;     // 0 = nothing to collect
+
+static int index_thread(void *arg) {
+    (void)arg;
+    char path[1024];
+    for (;;) {
+        plat_mutex_lock(m);
+        uint32_t id = ix_req_id;
+        ix_req_id = 0;
+        if (id) snprintf(path, sizeof path, "%s", ix_path);
+        plat_mutex_unlock(m);
+        if (!id) { plat_sleep_us(50000); continue; }
+        uint64_t total;
+        void *ix = decoder_mp3_index(path, &total);
+        plat_mutex_lock(m);
+        if (ix_result_id) decoder_mp3_index_free(ix_result); // never collected
+        ix_result = ix; ix_total = total; ix_result_id = id;
+        plat_mutex_unlock(m);
+    }
+    return 0;
+}
+
 // ---- audio thread state ----
 static decoder dec;
 static int dec_open;
@@ -226,6 +258,11 @@ static int open_at(int pos, int *fill) {
     if (ok) {
         dec_open = 1;
         src_pos = 0;
+        open_id++;
+        if (dec.fmt == FMT_MP3 && !dec.mp3_seek_ready) {
+            snprintf(ix_path, sizeof ix_path, "%s", path);
+            ix_req_id = open_id;
+        }
         int want = pick_out_rate(dec.rate);
         st.rate = dec.rate; st.bits = dec.bits; st.channels = dec.channels;
         st.total = dec.total_frames; st.fmt = dec.fmt; st.pos = 0;
@@ -261,7 +298,22 @@ static int audio_thread(void *arg) {
         int play = cmd_play; cmd_play = -1;
         int64_t seek = cmd_seek; cmd_seek = -1;
         int is_paused = paused;
+        void *ix = NULL;
+        uint64_t ixt = 0;
+        uint32_t ixid = ix_result_id;
+        if (ixid) { ix = ix_result; ixt = ix_total; ix_result_id = 0; }
         plat_mutex_unlock(m);
+
+        if (ixid) {
+            if (dec_open && ixid == open_id) {
+                decoder_mp3_use_index(&dec, ix, ixt);
+                plat_mutex_lock(m);
+                if (!st.total) st.total = dec.total_frames;
+                plat_mutex_unlock(m);
+            } else {
+                decoder_mp3_index_free(ix); // for a track that's gone
+            }
+        }
 
         if (play >= 0) {
             fill = 0; // drop whatever was half-built from the old track
@@ -323,6 +375,7 @@ void player_init(void) {
     st.out_rate = out_rate;
     paused = 1;
     plat_thread_start(audio_thread, NULL, 1);
+    plat_thread_start(index_thread, NULL, 0);
 }
 
 void player_set_queue(char **paths, int n, int start) {
@@ -358,7 +411,8 @@ void player_toggle_pause(void) {
 void player_next(void) {
     plat_mutex_lock(m);
     if (qn > 0) {
-        int nxt = opos + 1;
+        // count from a switch that's still pending, so quick presses add up
+        int nxt = (cmd_play >= 0 ? cmd_play : opos) + 1;
         if (nxt >= qn) { if (shuffle_on) build_order(0); nxt = 0; }
         cmd_play = nxt;
         paused = 0;
@@ -369,8 +423,9 @@ void player_next(void) {
 void player_prev(void) {
     plat_mutex_lock(m);
     if (qn > 0) {
-        if (st.has_track && st.rate && st.pos > (uint64_t)st.rate * 3) cmd_seek = 0;
-        else cmd_play = opos > 0 ? opos - 1 : (repeat_mode == REPEAT_ALL ? qn - 1 : 0);
+        int cur = cmd_play >= 0 ? cmd_play : opos;
+        if (cmd_play < 0 && st.has_track && st.rate && st.pos > (uint64_t)st.rate * 3) cmd_seek = 0;
+        else cmd_play = cur > 0 ? cur - 1 : (repeat_mode == REPEAT_ALL ? qn - 1 : 0);
         paused = 0;
     }
     plat_mutex_unlock(m);

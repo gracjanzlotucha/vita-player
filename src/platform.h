@@ -46,7 +46,12 @@ plat_mutex *plat_mutex_create(void);
 void plat_mutex_lock(plat_mutex *m);
 void plat_mutex_unlock(plat_mutex *m);
 typedef int (*plat_thread_fn)(void *arg);
+// high_priority: the audio thread (own core). Otherwise a low-priority
+// background worker on another core, so neither competes with the UI.
 int  plat_thread_start(plat_thread_fn fn, void *arg, int high_priority);
+// Raise the CPU clock for a burst of heavy work (cover art decoding);
+// calls nest, the clock drops back when the last one ends.
+void plat_cpu_boost(int on);
 
 // Audio output: signed 16-bit stereo interleaved.
 #define AUDIO_GRAIN 1024

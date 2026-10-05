@@ -68,6 +68,8 @@ int plat_thread_start(plat_thread_fn fn, void *arg, int hp) {
     return pthread_create(&t, NULL, entry, s);
 }
 
+void plat_cpu_boost(int on) { (void)on; }
+
 int plat_audio_rate_supported(int rate) {
     switch (rate) {
     case 8000: case 11025: case 12000: case 16000: case 22050:

@@ -1,4 +1,5 @@
 #include "decoder.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -40,29 +41,60 @@ const char *format_label(audio_format f) {
     }
 }
 
+// Files are read through stdio with a large buffer: on the Vita every read
+// is a syscall to the memory card, and the libraries read in small pieces.
+// The three dr_libs share one callback shape (SET/CUR/END = 0/1/2).
+#define FILE_BUF (128 * 1024)
+static FILE *fopen_buffered(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f) setvbuf(f, NULL, _IOFBF, FILE_BUF);
+    return f;
+}
+static size_t io_read(void *u, void *buf, size_t n) { return fread(buf, 1, n, (FILE *)u); }
+static int io_seek(void *u, int off, int origin) {
+    return fseek((FILE *)u, off, origin == 1 ? SEEK_CUR : origin == 2 ? SEEK_END : SEEK_SET) == 0;
+}
+static int io_tell(void *u, int64_t *pos) {
+    long p = ftell((FILE *)u);
+    if (p < 0) return 0;
+    *pos = p;
+    return 1;
+}
+
+static int mp3_init(drmp3 *m, FILE *f) {
+    return drmp3_init(m, io_read, (drmp3_seek_proc)io_seek, (drmp3_tell_proc)io_tell, NULL, f, NULL);
+}
+
 int decoder_open(decoder *d, const char *path) {
     memset(d, 0, sizeof *d);
     d->fmt = format_from_name(path);
+    if (d->fmt == FMT_FLAC || d->fmt == FMT_WAV || d->fmt == FMT_MP3) {
+        if (!(d->file = fopen_buffered(path))) return -1;
+    }
     switch (d->fmt) {
     case FMT_FLAC: {
-        drflac *f = drflac_open_file(path, NULL);
-        if (!f) return -1;
+        drflac *f = drflac_open(io_read, (drflac_seek_proc)io_seek, (drflac_tell_proc)io_tell, d->file, NULL);
+        if (!f) { fclose(d->file); d->file = NULL; return -1; }
         d->h = f; d->rate = f->sampleRate; d->channels = f->channels;
         d->bits = f->bitsPerSample; d->total_frames = f->totalPCMFrameCount;
         break;
     }
     case FMT_WAV: {
         drwav *w = malloc(sizeof *w);
-        if (!drwav_init_file(w, path, NULL)) { free(w); return -1; }
+        if (!drwav_init(w, io_read, (drwav_seek_proc)io_seek, (drwav_tell_proc)io_tell, d->file, NULL)) {
+            free(w); fclose(d->file); d->file = NULL; return -1;
+        }
         d->h = w; d->rate = w->sampleRate; d->channels = w->channels;
         d->bits = w->bitsPerSample; d->total_frames = w->totalPCMFrameCount;
         break;
     }
     case FMT_MP3: {
         drmp3 *m = malloc(sizeof *m);
-        if (!drmp3_init_file(m, path, NULL)) { free(m); return -1; }
+        if (!mp3_init(m, d->file)) { free(m); fclose(d->file); d->file = NULL; return -1; }
         d->h = m; d->rate = m->sampleRate; d->channels = m->channels; d->bits = 16;
-        d->total_frames = drmp3_get_pcm_frame_count(m);
+        // Known from the Xing/Info header; otherwise counting means reading the
+        // whole file, which the background index does (decoder_mp3_index).
+        d->total_frames = m->totalPCMFrameCount != DRMP3_UINT64_MAX ? drmp3_get_pcm_frame_count(m) : 0;
         break;
     }
     case FMT_OGG: {
@@ -90,6 +122,7 @@ void decoder_close(decoder *d) {
     default: break;
     }
     d->h = NULL;
+    if (d->file) { fclose(d->file); d->file = NULL; }
     free(d->aux);
     d->aux = NULL;
 }
@@ -167,3 +200,40 @@ int decoder_seek(decoder *d, uint64_t frame) {
     default: return -1;
     }
 }
+
+typedef struct { drmp3_uint32 n; drmp3_seek_point pts[]; } mp3_index;
+
+void *decoder_mp3_index(const char *path, uint64_t *total) {
+    *total = 0;
+    FILE *f = fopen_buffered(path);
+    if (!f) return NULL;
+    drmp3 m;
+    if (!mp3_init(&m, f)) { fclose(f); return NULL; }
+    if (m.totalPCMFrameCount == DRMP3_UINT64_MAX) {
+        drmp3_uint64 mp3_frames, pcm_frames;
+        if (drmp3_get_mp3_and_pcm_frame_count(&m, &mp3_frames, &pcm_frames)) *total = pcm_frames;
+    }
+    mp3_index *ix = malloc(sizeof *ix + 1024 * sizeof(drmp3_seek_point));
+    if (ix) {
+        ix->n = 1024;
+        if (!drmp3_calculate_seek_points(&m, &ix->n, ix->pts)) { free(ix); ix = NULL; }
+    }
+    drmp3_uninit(&m);
+    fclose(f);
+    return ix;
+}
+
+void decoder_mp3_use_index(decoder *d, void *index, uint64_t total) {
+    mp3_index *ix = index;
+    if (d->fmt != FMT_MP3 || !d->h) { free(ix); return; }
+    if (!d->total_frames && total) d->total_frames = total;
+    if (d->mp3_seek_ready) { free(ix); return; } // a seek already built one
+    if (ix) {
+        drmp3_bind_seek_table(d->h, ix->n, ix->pts);
+        free(d->aux);
+        d->aux = ix;
+    }
+    d->mp3_seek_ready = 1;
+}
+
+void decoder_mp3_index_free(void *index) { free(index); }

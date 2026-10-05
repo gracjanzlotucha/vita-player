@@ -1,6 +1,7 @@
 #include "platform.h"
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/display.h>
 #include <psp2/ctrl.h>
@@ -32,6 +33,7 @@ static uint32_t *render_buf; // cached RAM; copied to CDRAM on present
 static int audio_port = -1;
 static int audio_rate;
 static int main_port_fallback; // BGM port refused: locked to 48 kHz
+static SceUID boost_mtx = -1;
 
 int plat_init(void) {
     for (int i = 0; i < 2; i++) {
@@ -45,6 +47,7 @@ int plat_init(void) {
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
     // Decoding FLAC is cheap, but give the UI headroom for cover art scaling.
     scePowerSetArmClockFrequency(333);
+    boost_mtx = sceKernelCreateMutex("fid_boost", 0, 0, NULL);
     return 0;
 }
 
@@ -179,11 +182,26 @@ static int thread_entry(SceSize args, void *argp) {
 }
 int plat_thread_start(plat_thread_fn fn, void *arg, int high_priority) {
     thread_start s = { fn, arg };
-    SceUID t = sceKernelCreateThread("fid_thread", thread_entry,
-                                     high_priority ? 0x50 : 0xA0,
-                                     256 * 1024, 0, 0, NULL);
+    // The UI runs on the main thread (core 0); audio gets core 1 to itself and
+    // background work (cover art, MP3 indexing) goes to core 2.
+    SceUID t = sceKernelCreateThread(high_priority ? "fid_audio" : "fid_worker", thread_entry,
+                                     high_priority ? 0x50 : 0xB0,
+                                     256 * 1024, 0,
+                                     high_priority ? SCE_KERNEL_CPU_MASK_USER_1 : SCE_KERNEL_CPU_MASK_USER_2, NULL);
     if (t < 0) return -1;
     return sceKernelStartThread(t, sizeof s, &s); // args are copied
+}
+
+// 333 MHz normally (battery); 444 MHz while something heavy runs.
+static int boost_count;
+void plat_cpu_boost(int on) {
+    sceKernelLockMutex(boost_mtx, 1, NULL);
+    int before = boost_count;
+    boost_count += on ? 1 : -1;
+    if (boost_count < 0) boost_count = 0;
+    if (!before && boost_count) scePowerSetArmClockFrequency(444);
+    else if (before && !boost_count) scePowerSetArmClockFrequency(333);
+    sceKernelUnlockMutex(boost_mtx, 1);
 }
 
 int plat_audio_rate_supported(int rate) {

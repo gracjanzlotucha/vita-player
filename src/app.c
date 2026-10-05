@@ -299,41 +299,40 @@ static void fmt_rate(char *b, size_t n, uint32_t rate) {
 
 
 // ---------------------------------------------------------------- track info
+// Tags, cover art and the Now playing background are prepared on a worker
+// thread (its own core on the Vita), so a track change never stalls the UI:
+// it keeps the previous info for the few ms until the new tags arrive, and
+// the art follows when decoded. Art is identified by a hash of the picture
+// bytes, so tracks sharing a cover (an album) reuse it without decoding.
+
 // Now playing background, per the Figma "Background" layer: the cover in a
 // 1051x1050 frame at (-46,-253), saturation +29%, 128 px layer blur, a faint
-// noise, at 20% opacity over black. Built once per track into a full-screen
-// image, so each frame is a plain copy. The blur runs on a 64x64 grid (the
-// cover is that soft anyway) with transparent padding, so the edges fade out
-// like a Figma layer blur does.
-static void build_np_bg(const image *cov) {
+// noise, at 20% opacity over black. The blur runs on a 64x64 grid (the cover
+// is that soft anyway) with transparent padding, so the edges fade out like
+// a Figma layer blur does.
+static int build_bg(const image *cov, image *out) {
     enum { G = 64, PAD = 14, N = G + 2 * PAD };
     const float fx = -46, fy = -253, fw = 1051, fh = 1050;
-    image_free(&np_bg);
-    np_bg.px = malloc(SCREEN_W * SCREEN_H * 4);
-    if (!np_bg.px) return;
-    np_bg.w = SCREEN_W; np_bg.h = SCREEN_H;
-    if (!cov->px) {
-        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) np_bg.px[i] = RGB(0, 0, 0);
-        return;
-    }
-    float *g = calloc(N * N * 4, sizeof *g), *t = calloc(N * N * 4, sizeof *t);
-    if (!g || !t) { free(g); free(t); image_free(&np_bg); return; }
-    // area-average the cover into the grid; premultiplied rgb + alpha
+    out->px = malloc(SCREEN_W * SCREEN_H * 4);
+    if (!out->px) return -1;
+    out->w = SCREEN_W; out->h = SCREEN_H;
+    float *g = calloc(N * N * 3, sizeof *g), *t = calloc(N * N * 3, sizeof *t);
+    if (!g || !t) { free(g); free(t); image_free(out); return -1; }
+    // area-average the cover into the grid (premultiplied: padding is 0)
     for (int gy = 0; gy < G; gy++)
         for (int gx = 0; gx < G; gx++) {
             int x0 = gx * cov->w / G, x1 = (gx + 1) * cov->w / G, y0 = gy * cov->h / G, y1 = (gy + 1) * cov->h / G;
-            float r = 0, gg = 0, b = 0;
-            int n = 0;
+            uint32_t r = 0, gg = 0, b = 0, n = 0;
             for (int y = y0; y < y1; y++)
                 for (int x = x0; x < x1; x++, n++) {
                     uint32_t p = cov->px[y * cov->w + x];
                     r += p & 255; gg += (p >> 8) & 255; b += (p >> 16) & 255;
                 }
             if (!n) continue;
-            r /= n; gg /= n; b /= n;
-            float l = 0.299f * r + 0.587f * gg + 0.114f * b; // saturation +29%
-            float *o = &g[((gy + PAD) * N + gx + PAD) * 4];
-            o[0] = l + (r - l) * 1.29f; o[1] = l + (gg - l) * 1.29f; o[2] = l + (b - l) * 1.29f; o[3] = 1;
+            float fr = (float)r / n, fg = (float)gg / n, fb = (float)b / n;
+            float l = 0.299f * fr + 0.587f * fg + 0.114f * fb; // saturation +29%
+            float *o = &g[((gy + PAD) * N + gx + PAD) * 3];
+            o[0] = l + (fr - l) * 1.29f; o[1] = l + (fg - l) * 1.29f; o[2] = l + (fb - l) * 1.29f;
             for (int k = 0; k < 3; k++) o[k] = o[k] < 0 ? 0 : o[k] > 255 ? 255 : o[k];
         }
     // separable gaussian; Figma's blur radius is about two sigmas
@@ -342,65 +341,170 @@ static void build_np_bg(const image *cov) {
     for (int i = 0; i <= 2 * PAD; i++) kw[i] /= ksum;
     for (int pass = 0; pass < 2; pass++) {
         float *src = pass ? t : g, *dst = pass ? g : t;
+        int step = pass ? N * 3 : 3;
         for (int y = 0; y < N; y++)
-            for (int x = 0; x < N; x++)
-                for (int c = 0; c < 4; c++) {
-                    float acc = 0;
-                    for (int k = -PAD; k <= PAD; k++) {
-                        int xx = pass ? x : x + k, yy = pass ? y + k : y;
-                        if (xx < 0 || yy < 0 || xx >= N || yy >= N) continue;
-                        acc += src[(yy * N + xx) * 4 + c] * kw[k + PAD];
-                    }
-                    dst[(y * N + x) * 4 + c] = acc;
+            for (int x = 0; x < N; x++) {
+                int c0 = pass ? y : x, lo = c0 - PAD < 0 ? -c0 : -PAD, hi = c0 + PAD >= N ? N - 1 - c0 : PAD;
+                const float *p = &src[(y * N + x) * 3];
+                float a0 = 0, a1 = 0, a2 = 0;
+                for (int k = lo; k <= hi; k++) {
+                    const float *q = p + k * step;
+                    float w = kw[k + PAD];
+                    a0 += q[0] * w; a1 += q[1] * w; a2 += q[2] * w;
                 }
+                float *o = &dst[(y * N + x) * 3];
+                o[0] = a0; o[1] = a1; o[2] = a2;
+            }
     }
-    // upscale bilinearly to the screen, 20% over black, plus noise that also
-    // breaks up banding in such a dark gradient
+    // upscale bilinearly: interpolate each screen row once across the grid,
+    // then along it. The noise also breaks up banding in a gradient this dark.
+    static int col_ix[SCREEN_W];
+    static float col_t[SCREEN_W];
+    for (int x = 0; x < SCREEN_W; x++) {
+        float u = (x - fx) / fw * G + PAD - 0.5f;
+        col_ix[x] = (int)floorf(u);
+        col_t[x] = u - col_ix[x];
+    }
+    float row[N * 3];
     uint32_t seed = 0x9E3779B9u;
     for (int y = 0; y < SCREEN_H; y++) {
         float v = (y - fy) / fh * G + PAD - 0.5f;
         int iy = (int)floorf(v);
         float ty = v - iy;
+        const float *r0 = &g[iy * N * 3], *r1 = r0 + N * 3;
+        for (int i = 0; i < N * 3; i++) row[i] = (r0[i] + (r1[i] - r0[i]) * ty) * 0.2f; // 20% opacity
+        uint32_t *o = &out->px[y * SCREEN_W];
         for (int x = 0; x < SCREEN_W; x++) {
-            float u = (x - fx) / fw * G + PAD - 0.5f;
-            int ix = (int)floorf(u);
-            float tx = u - ix;
-            const float *p00 = &g[(iy * N + ix) * 4], *p01 = p00 + 4, *p10 = p00 + N * 4, *p11 = p10 + 4;
+            const float *a = &row[col_ix[x] * 3];
+            float tx = col_t[x];
             seed = seed * 1664525u + 1013904223u;
-            float n1 = (seed >> 8) * (1.0f / 16777216.0f);
-            seed = seed * 1664525u + 1013904223u;
-            float n2 = (seed >> 8) * (1.0f / 16777216.0f);
-            uint32_t out = 0xFF000000u;
+            float grain = 0.95f + (seed >> 24) * (0.05f / 255.0f), dith = ((seed >> 8) & 255) * (1.0f / 255.0f);
+            uint32_t px = 0xFF000000u;
             for (int c = 0; c < 3; c++) {
-                float a = p00[c] + (p01[c] - p00[c]) * tx, b = p10[c] + (p11[c] - p10[c]) * tx;
-                float val = (a + (b - a) * ty) * 0.2f * (0.95f + 0.05f * n1) + n2 - 0.5f;
-                int q = (int)(val + 0.5f);
-                out |= (uint32_t)(q < 0 ? 0 : q > 255 ? 255 : q) << (c * 8);
+                int q = (int)((a[c] + (a[c + 3] - a[c]) * tx) * grain + dith);
+                px |= (uint32_t)(q > 255 ? 255 : q) << (c * 8);
             }
-            np_bg.px[y * SCREEN_W + x] = out;
+            o[x] = px;
         }
     }
     free(g); free(t);
+    return 0;
 }
 
-static void refresh_track(const player_status *s) {
-    if (s->serial == cur_serial) return;
-    cur_serial = s->serial;
-    tags_free(&cur_tags);
-    image_free(&cover_big);
-    image_free(&cover_small);
-    image_free(&np_bg);
-    if (!s->has_track && !s->path[0]) return;
-    tags_read(s->path, &cur_tags, 1);
-    if (cur_tags.cover_data) {
-        if (image_from_cover(cur_tags.cover_data, cur_tags.cover_size, 400, &cover_big) == 0) {
-            image_from_cover(cur_tags.cover_data, cur_tags.cover_size, 48, &cover_small);
+static uint32_t art_hash(const uint8_t *p, size_t n) {
+    uint32_t h = 2166136261u ^ (uint32_t)n;
+    size_t step = n > 65536 ? n / 65536 : 1; // sample big pictures
+    for (size_t i = 0; i < n; i += step) h = (h ^ p[i]) * 16777619u;
+    return h ? h : 1;
+}
+
+static plat_mutex *ld_m;
+// request (UI -> worker)
+static char ld_path[1024];
+static int ld_req;
+static uint32_t ld_req_id, ld_shown_art;
+// results (worker -> UI)
+static track_tags ld_tags;
+static uint32_t ld_tags_id, ld_tags_art; // ld_tags_id 0 = nothing new
+static image ld_big, ld_small, ld_bg;
+static uint32_t ld_art;                 // art id of ld_big & co, 0 = none
+
+static int loader_thread(void *arg) {
+    (void)arg;
+    char path[1024];
+    for (;;) {
+        plat_mutex_lock(ld_m);
+        int have = ld_req;
+        uint32_t id = ld_req_id, shown = ld_shown_art, ready = ld_art;
+        if (have) snprintf(path, sizeof path, "%s", ld_path);
+        ld_req = 0;
+        plat_mutex_unlock(ld_m);
+        if (!have) { plat_sleep_us(15000); continue; }
+
+        track_tags t;
+        tags_read(path, &t, 1);
+        uint8_t *cover = t.cover_data;
+        size_t cover_n = t.cover_size;
+        t.cover_data = NULL;
+        uint32_t art = cover ? art_hash(cover, cover_n) : 0;
+
+        plat_mutex_lock(ld_m);
+        ld_tags = t; ld_tags_art = art; ld_tags_id = id;
+        int newer = ld_req;
+        plat_mutex_unlock(ld_m);
+
+        if (art && art != shown && art != ready && !newer) {
+            image big = { 0 }, small = { 0 }, bg = { 0 };
+            plat_cpu_boost(1);
+            if (image_from_cover(cover, cover_n, 400, &big) == 0) {
+                image_scale(&big, 48, &small);
+                build_bg(&big, &bg);
+            }
+            plat_cpu_boost(0);
+            plat_mutex_lock(ld_m);
+            image_free(&ld_big); image_free(&ld_small); image_free(&ld_bg); // never collected
+            ld_big = big; ld_small = small; ld_bg = bg;
+            ld_art = big.px ? art : 0;
+            plat_mutex_unlock(ld_m);
         }
-        free(cur_tags.cover_data);
-        cur_tags.cover_data = NULL;
+        free(cover);
     }
-    build_np_bg(&cover_big);
+    return 0;
+}
+
+static char cur_path[1024];
+static uint32_t cur_req_id, want_art, shown_art;
+static int np_static_dirty = 1, last_has_track = -1;
+
+static void show_art(image *big, image *small, image *bg, uint32_t id) {
+    image_free(&cover_big); image_free(&cover_small); image_free(&np_bg);
+    cover_big = *big; cover_small = *small; np_bg = *bg;
+    memset(big, 0, sizeof *big); memset(small, 0, sizeof *small); memset(bg, 0, sizeof *bg);
+    shown_art = id;
+    np_static_dirty = 1;
     dirty = 1;
+}
+
+// Called every tick: asks the loader for a new track, collects its results.
+static void refresh_track(const player_status *s) {
+    if (s->serial != cur_serial) {
+        cur_serial = s->serial;
+        np_static_dirty = 1; // format, rate, bits come with the status
+        if (s->path[0] && strcmp(s->path, cur_path)) {
+            snprintf(cur_path, sizeof cur_path, "%s", s->path);
+            plat_mutex_lock(ld_m);
+            snprintf(ld_path, sizeof ld_path, "%s", s->path);
+            ld_req = 1;
+            ld_req_id = ++cur_req_id;
+            plat_mutex_unlock(ld_m);
+        }
+    }
+    if (s->has_track != last_has_track) { last_has_track = s->has_track; np_static_dirty = 1; }
+
+    plat_mutex_lock(ld_m);
+    if (ld_tags_id) {
+        if (ld_tags_id == cur_req_id) {
+            tags_free(&cur_tags);
+            cur_tags = ld_tags;
+            want_art = ld_tags_art;
+            np_static_dirty = 1;
+            dirty = 1;
+            if (!want_art && shown_art) { image none = { 0 }, n2 = { 0 }, n3 = { 0 }; show_art(&none, &n2, &n3, 0); }
+            else if (want_art != shown_art && ld_art != want_art) { // new art still decoding
+                image none = { 0 }, n2 = { 0 }, n3 = { 0 };
+                show_art(&none, &n2, &n3, 0);
+            }
+        } else {
+            tags_free(&ld_tags);
+        }
+        ld_tags_id = 0;
+    }
+    if (ld_art && ld_art == want_art && want_art != shown_art) {
+        show_art(&ld_big, &ld_small, &ld_bg, ld_art);
+        ld_art = 0;
+    }
+    ld_shown_art = shown_art;
+    plat_mutex_unlock(ld_m);
 }
 
 static void placeholder_cover(float x, float y, float s, float r) {
@@ -579,21 +683,16 @@ static float np_tag(float x, float y, const char *t, uint32_t bg, uint32_t fg) {
     return x + w + 8;
 }
 
-static void draw_playing(const player_status *s) {
+// The parts that only change with the track (background, artwork, details,
+// tags, hairlines) are drawn once into np_static; each frame copies it and
+// draws the clock, timeline and controls on top. Keeps scrubbing smooth.
+static image np_static;
+
+static void draw_np_static(const player_status *s) {
     if (np_bg.px) gfx_blit(&cv, &np_bg, 0, 0);
     else gfx_clear(&cv, RGB(0, 0, 0));
-
-    // top bar: 36 high, 36 px side padding, hairline below
-    gfx_rect(&cv, 0, 35, SCREEN_W, 1, NP_LINE);
-    char top[48], clk[16], right[48];
-    if (s->count > 0 && s->index >= 0) snprintf(top, sizeof top, "Now Playing %d/%d", s->index + 1, s->count);
-    else snprintf(top, sizeof top, "Now Playing");
-    np_text(FONT_GEIST, 12, 0, 36, 9.5f, top, C_TEXT, 0);
-    plat_clock_text(clk, sizeof clk);
-    int bat = plat_battery_percent();
-    if (bat >= 0) snprintf(right, sizeof right, "%s  \xE2\x80\xA2  %d%%%s", clk, bat, plat_battery_charging() ? " \xE2\x9A\xA1" : "");
-    else snprintf(right, sizeof right, "%s", clk);
-    np_text(FONT_GEIST, 12, 0, SCREEN_W - 36 - text_width(FONT_GEIST, 12, right), 9.5f, right, C_TEXT, 0);
+    gfx_rect(&cv, 0, 35, SCREEN_W, 1, NP_LINE);  // top bar hairline
+    gfx_rect(&cv, 0, 508, SCREEN_W, 1, NP_LINE); // bottom panel hairline
 
     // artwork 400x400, radius 20
     if (cover_big.px) gfx_image(&cv, &cover_big, 36, 72, 20, 255);
@@ -608,42 +707,72 @@ static void draw_playing(const player_status *s) {
     if (!s->has_track) {
         np_text(FONT_GEIST, 32, 36, x, 92, "Not Playing", C_TEXT, (int)w);
         np_text(FONT_GEIST, 20, 0, x, 135, "Pick something in the library", NP_TEXT2, (int)w);
-    } else {
-        np_text(FONT_GEIST, 32, 36, x, 92, cur_tags.title, C_TEXT, (int)w);
-        np_text(FONT_GEIST, 20, 0, x, 135, cur_tags.artist[0] ? cur_tags.artist : "Unknown Artist", NP_TEXT2, (int)w);
-        line[0] = 0;
-        if (cur_tags.album[0] && cur_tags.year[0]) snprintf(line, sizeof line, "%s \xE2\x80\xA2 %s", cur_tags.album, cur_tags.year);
-        else snprintf(line, sizeof line, "%s", cur_tags.album[0] ? cur_tags.album : cur_tags.year);
-        np_text(FONT_GEIST, 14, 0, x, 168, line, NP_TEXT2, (int)w);
-
-        // tags: [Hi-Res] Lossless, format, bit depth / rate
-        float tx = x;
-        int lossless = s->fmt == FMT_FLAC || s->fmt == FMT_WAV;
-        int hires = s->bits > 16 || s->rate > 48000;
-        if (lossless && hires) tx = np_tag(tx, 206, "Hi-Res Lossless", RGBA(255, 140, 64, 26), RGB(255, 181, 96));
-        else if (lossless) tx = np_tag(tx, 206, "Lossless", RGBA(255, 255, 255, 26), C_TEXT);
-        tx = np_tag(tx, 206, format_label(s->fmt), RGBA(255, 255, 255, 26), C_TEXT);
-        char rate[16], depth[40];
-        if (s->rate % 1000 == 0) snprintf(rate, sizeof rate, "%u kHz", s->rate / 1000);
-        else snprintf(rate, sizeof rate, "%.1f kHz", s->rate / 1000.0);
-        if (lossless) snprintf(depth, sizeof depth, "%u bit \xE2\x80\xA2 %s", s->bits, rate);
-        else snprintf(depth, sizeof depth, "%s", rate);
-        np_tag(tx, 206, depth, RGBA(255, 255, 255, 26), C_TEXT);
+        return;
     }
+    np_text(FONT_GEIST, 32, 36, x, 92, cur_tags.title, C_TEXT, (int)w);
+    np_text(FONT_GEIST, 20, 0, x, 135, cur_tags.artist[0] ? cur_tags.artist : "Unknown Artist", NP_TEXT2, (int)w);
+    line[0] = 0;
+    if (cur_tags.album[0] && cur_tags.year[0]) snprintf(line, sizeof line, "%s \xE2\x80\xA2 %s", cur_tags.album, cur_tags.year);
+    else snprintf(line, sizeof line, "%s", cur_tags.album[0] ? cur_tags.album : cur_tags.year);
+    np_text(FONT_GEIST, 14, 0, x, 168, line, NP_TEXT2, (int)w);
 
+    // tags: [Hi-Res] Lossless, format, bit depth / rate
+    float tx = x;
+    int lossless = s->fmt == FMT_FLAC || s->fmt == FMT_WAV;
+    int hires = s->bits > 16 || s->rate > 48000;
+    if (lossless && hires) tx = np_tag(tx, 206, "Hi-Res Lossless", RGBA(255, 140, 64, 26), RGB(255, 181, 96));
+    else if (lossless) tx = np_tag(tx, 206, "Lossless", RGBA(255, 255, 255, 26), C_TEXT);
+    tx = np_tag(tx, 206, format_label(s->fmt), RGBA(255, 255, 255, 26), C_TEXT);
+    char rate[16], depth[40];
+    if (s->rate % 1000 == 0) snprintf(rate, sizeof rate, "%u kHz", s->rate / 1000);
+    else snprintf(rate, sizeof rate, "%.1f kHz", s->rate / 1000.0);
+    if (lossless) snprintf(depth, sizeof depth, "%u bit \xE2\x80\xA2 %s", s->bits, rate);
+    else snprintf(depth, sizeof depth, "%s", rate);
+    np_tag(tx, 206, depth, RGBA(255, 255, 255, 26), C_TEXT);
+}
+
+static void draw_playing(const player_status *s) {
+    if (np_static_dirty || !np_static.px) {
+        if (!np_static.px && (np_static.px = malloc(SCREEN_W * SCREEN_H * 4))) {
+            np_static.w = SCREEN_W; np_static.h = SCREEN_H;
+        }
+        if (np_static.px) {
+            canvas screen = cv;
+            gfx_begin(&cv, np_static.px, SCREEN_W, SCREEN_H, SCREEN_W);
+            draw_np_static(s);
+            cv = screen;
+            np_static_dirty = 0;
+        }
+    }
+    if (np_static.px) gfx_blit(&cv, &np_static, 0, 0);
+    else draw_np_static(s);
+
+    // top bar: 36 high, 36 px side padding
+    char top[48], clk[16], right[48];
+    if (s->count > 0 && s->index >= 0) snprintf(top, sizeof top, "Now Playing %d/%d", s->index + 1, s->count);
+    else snprintf(top, sizeof top, "Now Playing");
+    np_text(FONT_GEIST, 12, 0, 36, 9.5f, top, C_TEXT, 0);
+    plat_clock_text(clk, sizeof clk);
+    int bat = plat_battery_percent();
+    if (bat >= 0) snprintf(right, sizeof right, "%s  \xE2\x80\xA2  %d%%%s", clk, bat, plat_battery_charging() ? " \xE2\x9A\xA1" : "");
+    else snprintf(right, sizeof right, "%s", clk);
+    np_text(FONT_GEIST, 12, 0, SCREEN_W - 36 - text_width(FONT_GEIST, 12, right), 9.5f, right, C_TEXT, 0);
+
+    const float x = 472, w = 452;
     // timeline: 8 px bar (12 px while scrubbing), times 10 px below
     float frac = s->total ? (float)s->pos / s->total : 0;
     uint64_t pos = s->pos;
     if (scrub >= 0 && s->total) { frac = scrub; pos = (uint64_t)(scrub * s->total); }
     if (frac > 1) frac = 1;
     float bh = scrub >= 0 ? 12 : 8, by = 330 - bh / 2;
-    if (s->has_track) hot(x - 16, 306, w + 32, 52, -1, Z_SEEK, 0);
+    if (s->has_track && s->total) hot(x - 16, 306, w + 32, 52, -1, Z_SEEK, 0);
     gfx_rrect(&cv, x, by, w, bh, bh / 2, RGBA(255, 255, 255, 90)); // Figma: 30% additive
     if (s->has_track && frac > 0) gfx_rrect(&cv, x, by, w * frac < bh ? bh : w * frac, bh, bh / 2, RGB(255, 255, 255)); // 70% additive saturates to white
     if (s->has_track) {
         char a[16], b[16];
         np_time(a, sizeof a, pos, s->rate);
-        np_time(b, sizeof b, s->total, s->rate);
+        if (s->total) np_time(b, sizeof b, s->total, s->rate);
+        else snprintf(b, sizeof b, "--:--"); // MP3 length still being counted
         np_text(FONT_GEIST_MEDIUM, 12, 0, x, 344, a, NP_TEXT2, 0);
         np_text(FONT_GEIST_MEDIUM, 12, 0, x + w - text_width(FONT_GEIST_MEDIUM, 12, b), 344, b, NP_TEXT2, 0);
     }
@@ -668,8 +797,7 @@ static void draw_playing(const player_status *s) {
         np_text(FONT_GEIST_MEDIUM, 10, 14, 927 - ow / 2.0f, 394, "1", RGB(20, 20, 22), 0);
     }
 
-    // bottom panel: hairline on top, button hints inside
-    gfx_rect(&cv, 0, 508, SCREEN_W, 1, NP_LINE);
+    // bottom panel: button hints
     hint h[] = {
         { BTN_CROSS, "Play/Pause" },
         { BTN_LEFT | BTN_RIGHT, "Seek" },
@@ -937,6 +1065,8 @@ int app_init(const char *asset_dir) {
     snprintf(p, sizeof p, "%s/Geist-Medium.ttf", asset_dir);
     if (font_load(FONT_GEIST_MEDIUM, p, 1)) return -1;
     np_icons_init();
+    ld_m = plat_mutex_create();
+    plat_thread_start(loader_thread, NULL, 0);
 
     plat_mkdir(plat_data_dir());
     snprintf(settings_path, sizeof settings_path, "%s/settings.txt", plat_data_dir());
@@ -955,7 +1085,7 @@ int app_init(const char *asset_dir) {
     return 0;
 }
 
-void app_force_redraw(void) { dirty = 1; }
+void app_force_redraw(void) { dirty = 1; np_static_dirty = 1; }
 
 int app_step(uint32_t b) {
     player_status s;
