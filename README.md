@@ -69,7 +69,7 @@ cmake .. && make
 ```
 
 `third_party/` holds dr_libs (FLAC/MP3/WAV), stb_vorbis, stb_image and
-stb_truetype. The UI font is Inter (SIL Open Font License).
+stb_truetype. The UI fonts are Inter and Geist (both SIL Open Font License).
 
 There is also a desktop test build (no Vita needed) that runs the same app
 code, writes screenshots to PNG and audio to WAV:

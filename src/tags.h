@@ -6,6 +6,7 @@ typedef struct { int w, h; uint32_t *px; } image; // RGBA8888, R low byte
 
 typedef struct {
     char title[256], artist[256], album[256];
+    char year[8];         // "2020", or empty
     int track_no;
     uint8_t *cover_data;  // raw embedded/folder image bytes (jpg/png)
     size_t cover_size;

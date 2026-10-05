@@ -37,7 +37,23 @@ from the memory card. See README.md for controls and the user-facing feature lis
   Exceptions are list drag/fling scrolling (`list_y`, pixels) and progress-bar
   scrubbing (`player_seek_to` on release).
 - `gfx.c`: software renderer (anti-aliased SDF shapes, images, stb_truetype text)
-  into a RAM buffer that is copied to a CDRAM framebuffer on present.
+  into a RAM buffer that is copied to a CDRAM framebuffer on present. Also
+  rasterises SVG path data into coverage masks (`mask_from_path`), used for
+  icons copied straight from Figma.
+
+## Design
+- Source of truth: Gracjan's Figma file `aneQdWK0xWY8aeacwMLOuV` (Figma
+  connector). Frames are 960x544, so Figma coordinates map 1:1 to the screen.
+- Now playing (node `1:2`) is implemented. The library screen still has the old
+  placeholder look and is next.
+- Fonts loaded with `css_px=1` (Geist) take Figma/CSS em sizes and are kerned;
+  `np_text()` positions text by its Figma line-box top. Inter faces keep the old
+  sizing until the library is redesigned.
+- The Now playing background (blurred, saturated cover at 20%) is built once per
+  track in `build_np_bg()` and blitted each frame.
+- Not in the Figma frame, so designed to match: pause icon, active
+  shuffle/repeat pill, repeat-one badge, "Not Playing" state, the hint row in
+  the bottom panel, toast.
 
 ## Building
 Vita: VitaSDK at `$VITASDK`, then `mkdir build && cd build && cmake .. && make`

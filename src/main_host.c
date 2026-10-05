@@ -89,31 +89,55 @@ int main(int argc, char **argv) {
         tap_at(300, 80 + 52 * 2 + 26); // play the third visible row
         run_ms(800);
         shot("t06_now_playing");
-        touch(655, 400);           // press play/pause: pressed highlight
+        touch(698, 416);           // press play/pause: pressed highlight
         shot("t07_pressed");
         lift();                    // ...release pauses
         shot("t08_paused");
-        tap_at(465, 400);          // shuffle
+        tap_at(484, 416);          // shuffle
         shot("t09_shuffle");
-        drag(420, 303, 655, 303, 300, 1); // scrub to the middle
+        drag(475, 330, 698, 330, 300, 1); // scrub to the middle
         shot("t10_scrubbing");
         lift();
         shot("t11_after_seek");
-        tap_at(750, 400);          // next
+        tap_at(786, 416);          // next
         run_ms(300);
         shot("t12_next");
-        tap_at(760, 524);          // "Library" hint
+        tap_at(760, 526);          // "Library" hint
         run_ms(200);
         shot("t13_library_hint");
         tap_at(896, 465);          // mini player play/pause
         shot("t14_mini_toggle");
         tap_at(300, 465);          // mini player card -> now playing
         shot("t15_mini_open");
-        tap_at(880, 524);          // "Screen off" hint
-        tap_at(655, 400);          // ignored while the screen is off
+        tap_at(880, 526);          // "Screen off" hint
+        tap_at(698, 416);          // ignored while the screen is off
         tap(BTN_SELECT);           // wake
         shot("t16_after_wake");
 
+    } else if (!strcmp(script, "np")) {
+        // Now playing states. HOST_ROOT = an album folder; plays its 3rd file.
+        shot("np01_nothing_playing_lib");
+        tap(BTN_TRIANGLE);
+        shot("np02_not_playing");
+        tap(BTN_CIRCLE);
+        tap(BTN_DOWN); tap(BTN_DOWN);
+        tap(BTN_CROSS);
+        run_ms(600);
+        tap(BTN_CROSS);            // pause
+        tap_at(550, 330);          // seek to ~17%
+        run_ms(300);
+        shot("np03_paused");
+        tap(BTN_CROSS);            // play
+        tap(BTN_SQUARE);           // shuffle on
+        tap(BTN_TRIANGLE); tap(BTN_TRIANGLE); // repeat one
+        run_ms(200);
+        shot("np04_playing_modes");
+        drag(560, 330, 760, 330, 300, 1);
+        shot("np05_scrubbing");
+        lift();
+        touch(698, 416);
+        shot("np06_pressed_play");
+        lift();
     } else if (!strcmp(script, "audio")) {
         // play whole tree and let it run to the end, gapless check
         host_realtime_audio = 0;
