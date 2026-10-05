@@ -103,13 +103,18 @@ void plat_display_on(void) {
 // from kicking in while music plays (that path pauses audio too).
 void plat_keep_awake(void)  { sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT); }
 
+// Older VitaSDK headers lack ON_DEACTIVATE and REQUEST_QUIT, so use the values.
+#define SYSEV_ON_DEACTIVATE 0x10000002
+#define SYSEV_ON_RESUME     0x10000003
+#define SYSEV_REQUEST_QUIT  0x20000001
+
 int plat_focus_event(void) {
     SceAppMgrSystemEvent ev;
     int hit = 0;
     while (sceAppMgrReceiveSystemEvent(&ev) == 0) {
-        if (ev.systemEvent == SCE_APPMGR_SYSTEMEVENT_ON_DEACTIVATE ||
-            ev.systemEvent == SCE_APPMGR_SYSTEMEVENT_ON_RESUME ||
-            ev.systemEvent == SCE_APPMGR_SYSTEMEVENT_REQUEST_QUIT) {
+        if (ev.systemEvent == SYSEV_ON_DEACTIVATE ||
+            ev.systemEvent == SYSEV_ON_RESUME ||
+            ev.systemEvent == SYSEV_REQUEST_QUIT) {
             plat_log("system event 0x%08X", ev.systemEvent);
             hit = 1;
         }
