@@ -389,6 +389,16 @@ void player_seek_rel(int seconds) {
     plat_mutex_unlock(m);
 }
 
+void player_seek_to(uint64_t frame) {
+    plat_mutex_lock(m);
+    if (st.has_track && st.rate) {
+        if (st.total && frame >= st.total) frame = st.total - 1;
+        cmd_seek = (int64_t)frame;
+        st.pos = frame;
+    }
+    plat_mutex_unlock(m);
+}
+
 void player_set_shuffle(int on) {
     plat_mutex_lock(m);
     shuffle_on = on;

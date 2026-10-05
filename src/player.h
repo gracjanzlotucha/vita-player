@@ -24,6 +24,7 @@ void player_toggle_pause(void);
 void player_next(void);
 void player_prev(void);
 void player_seek_rel(int seconds);
+void player_seek_to(uint64_t frame);  // source frame
 void player_set_shuffle(int on);
 void player_cycle_repeat(void);
 void player_set_modes(int shuffle, int repeat); // restore settings

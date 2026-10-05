@@ -25,6 +25,14 @@ static void set_field(char *dst, const char *src, size_t n) {
     dst[i] = 0;
 }
 
+// keeps the year from "2020", "2020-03-14" etc.
+static void set_year(track_tags *t, const char *v) {
+    if (t->year[0]) return;
+    for (int i = 0; i < 4; i++) if (v[i] < '0' || v[i] > '9') return;
+    memcpy(t->year, v, 4);
+    t->year[4] = 0;
+}
+
 // "KEY=value" vorbis comment
 static void vorbis_comment(track_tags *t, const char *c, size_t n) {
     const char *eq = memchr(c, '=', n);
@@ -40,6 +48,7 @@ static void vorbis_comment(track_tags *t, const char *c, size_t n) {
     else if (kl == 11 && !strncasecmp(c, "ALBUMARTIST", 11) && !t->artist[0]) set_field(t->artist, val, vl);
     else if (kl == 5 && !strncasecmp(c, "ALBUM", 5)) set_field(t->album, val, vl);
     else if (kl == 11 && !strncasecmp(c, "TRACKNUMBER", 11)) t->track_no = atoi(val);
+    else if ((kl == 4 && !strncasecmp(c, "DATE", 4)) || (kl == 4 && !strncasecmp(c, "YEAR", 4))) set_year(t, val);
 }
 
 // FLAC PICTURE block -> image bytes (prefers type 3 = front cover)
@@ -164,6 +173,7 @@ static void read_id3(FILE *f, track_tags *t, int want_cover) {
         else if ((!strcmp(id, "TPE2") || !strcmp(id, "TP2")) && !t->artist[0]) id3_text(t->artist, d, fl);
         else if (!strcmp(id, "TALB") || !strcmp(id, "TAL")) id3_text(t->album, d, fl);
         else if (!strcmp(id, "TRCK") || !strcmp(id, "TRK")) { char n[16] = { 0 }; id3_text(n, d, fl < 15 ? fl : 15); t->track_no = atoi(n); }
+        else if (!strcmp(id, "TDRC") || !strcmp(id, "TYER") || !strcmp(id, "TYE")) { char y[16] = { 0 }; id3_text(y, d, fl < 15 ? fl : 15); set_year(t, y); }
         else if (want_cover && (!strcmp(id, "APIC") || !strcmp(id, "PIC"))) id3_apic(t, d, fl, ver == 2);
         p += fl;
     }

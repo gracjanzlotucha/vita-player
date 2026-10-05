@@ -180,11 +180,208 @@ void gfx_image(canvas *c, const image *img, int x, int y, float r, uint8_t alpha
     }
 }
 
+void gfx_blit(canvas *c, const image *img, int x, int y) {
+    if (!img || !img->px) return;
+    int x0 = x < c->cx0 ? c->cx0 : x, x1 = x + img->w > c->cx1 ? c->cx1 : x + img->w;
+    if (x1 <= x0) return;
+    for (int iy = 0; iy < img->h; iy++) {
+        int yy = y + iy;
+        if (yy < c->cy0 || yy >= c->cy1) continue;
+        memcpy(&c->px[yy * c->stride + x0], &img->px[iy * img->w + x0 - x], (size_t)(x1 - x0) * 4);
+    }
+}
+
+// ---------------- path masks ----------------
+typedef struct { float x0, y0, x1, y1; } pedge;
+typedef struct { pedge *e; int n, cap; float cx, cy, sx, sy; float scale; } pbuild;
+
+static void pb_line(pbuild *b, float x, float y) {
+    if (b->n == b->cap) { b->cap = b->cap ? b->cap * 2 : 64; b->e = realloc(b->e, b->cap * sizeof *b->e); }
+    b->e[b->n++] = (pedge){ b->cx * b->scale, b->cy * b->scale, x * b->scale, y * b->scale };
+    b->cx = x; b->cy = y;
+}
+
+static void pb_cubic(pbuild *b, float x1, float y1, float x2, float y2, float x, float y) {
+    float x0 = b->cx, y0 = b->cy;
+    for (int i = 1; i <= 16; i++) {
+        float t = i / 16.0f, u = 1 - t;
+        pb_line(b, u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x,
+                   u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y);
+    }
+}
+
+static const char *pnum(const char *p, float *v) {
+    while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t' || *p == '\r') p++;
+    char *end;
+    *v = strtof(p, &end);
+    return end == p ? NULL : end;
+}
+
+static int path_has_num(const char *p) {
+    while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t' || *p == '\r') p++;
+    return (*p >= '0' && *p <= '9') || *p == '-' || *p == '+' || *p == '.';
+}
+
+static void path_parse(pbuild *b, const char *p) {
+    char cmd = 0;
+    float lcx = 0, lcy = 0; // last control point, for S/T
+    char prev = 0;
+    while (*p) {
+        while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t' || *p == '\r') p++;
+        if (!*p) break;
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) cmd = *p++;
+        else if (!cmd || !path_has_num(p)) { p++; continue; }
+        int rel = cmd >= 'a';
+        float ox = rel ? b->cx : 0, oy = rel ? b->cy : 0, v[6];
+        switch (cmd | 0x20) {
+        case 'z':
+            if (b->cx != b->sx || b->cy != b->sy) pb_line(b, b->sx, b->sy);
+            cmd = 0; // Z takes no numbers: skip any stray ones
+            break;
+        case 'm':
+            if (!(p = pnum(p, &v[0])) || !(p = pnum(p, &v[1]))) return;
+            if (b->cx != b->sx || b->cy != b->sy) pb_line(b, b->sx, b->sy); // close previous subpath
+            b->cx = b->sx = ox + v[0]; b->cy = b->sy = oy + v[1];
+            cmd = rel ? 'l' : 'L'; // further pairs are line-tos
+            break;
+        case 'l':
+            if (!(p = pnum(p, &v[0])) || !(p = pnum(p, &v[1]))) return;
+            pb_line(b, ox + v[0], oy + v[1]);
+            break;
+        case 'h':
+            if (!(p = pnum(p, &v[0]))) return;
+            pb_line(b, ox + v[0], b->cy);
+            break;
+        case 'v':
+            if (!(p = pnum(p, &v[0]))) return;
+            pb_line(b, b->cx, oy + v[0]);
+            break;
+        case 'c':
+            for (int i = 0; i < 6; i++) if (!(p = pnum(p, &v[i]))) return;
+            pb_cubic(b, ox + v[0], oy + v[1], ox + v[2], oy + v[3], ox + v[4], oy + v[5]);
+            lcx = ox + v[2]; lcy = oy + v[3];
+            break;
+        case 's': {
+            for (int i = 0; i < 4; i++) if (!(p = pnum(p, &v[i]))) return;
+            int smooth = (prev | 0x20) == 'c' || (prev | 0x20) == 's';
+            float x1 = smooth ? 2 * b->cx - lcx : b->cx, y1 = smooth ? 2 * b->cy - lcy : b->cy;
+            pb_cubic(b, x1, y1, ox + v[0], oy + v[1], ox + v[2], oy + v[3]);
+            lcx = ox + v[0]; lcy = oy + v[1];
+            break;
+        }
+        case 'q': case 't': {
+            float qx, qy;
+            if ((cmd | 0x20) == 'q') {
+                for (int i = 0; i < 4; i++) if (!(p = pnum(p, &v[i]))) return;
+                qx = ox + v[0]; qy = oy + v[1]; v[0] = v[2]; v[1] = v[3];
+            } else {
+                for (int i = 0; i < 2; i++) if (!(p = pnum(p, &v[i]))) return;
+                int smooth = (prev | 0x20) == 'q' || (prev | 0x20) == 't';
+                qx = smooth ? 2 * b->cx - lcx : b->cx; qy = smooth ? 2 * b->cy - lcy : b->cy;
+            }
+            float x = ox + v[0], y = oy + v[1];
+            pb_cubic(b, b->cx + 2.0f / 3 * (qx - b->cx), b->cy + 2.0f / 3 * (qy - b->cy),
+                     x + 2.0f / 3 * (qx - x), y + 2.0f / 3 * (qy - y), x, y);
+            lcx = qx; lcy = qy;
+            break;
+        }
+        case 'a': // arcs are not used by our icons: approximate with a line
+            for (int i = 0; i < 5; i++) if (!(p = pnum(p, &v[0]))) return;
+            if (!(p = pnum(p, &v[0])) || !(p = pnum(p, &v[1]))) return;
+            pb_line(b, ox + v[0], oy + v[1]);
+            break;
+        default:
+            p++;
+            break;
+        }
+        prev = cmd;
+    }
+    if (b->cx != b->sx || b->cy != b->sy) pb_line(b, b->sx, b->sy);
+}
+
+typedef struct { float x; int dir; } xing;
+static int xing_cmp(const void *a, const void *b) {
+    float d = ((const xing *)a)->x - ((const xing *)b)->x;
+    return d < 0 ? -1 : d > 0;
+}
+
+// Scanline fill: 5 sub-rows per pixel, exact horizontal coverage.
+int mask_from_path(mask *m, int w, int h, float scale, const char *d, int evenodd) {
+    enum { SS = 5 };
+    pbuild b = { 0 };
+    b.scale = scale;
+    path_parse(&b, d);
+    m->w = w; m->h = h;
+    m->a = calloc((size_t)w * h, 1);
+    float *acc = malloc((w + 1) * sizeof *acc);
+    xing *xs = malloc((b.n + 1) * sizeof *xs);
+    if (!m->a || !acc || !xs) { free(acc); free(xs); free(b.e); return -1; }
+    for (int y = 0; y < h; y++) {
+        memset(acc, 0, (w + 1) * sizeof *acc);
+        for (int s = 0; s < SS; s++) {
+            float sy = y + (s + 0.5f) / SS;
+            int nx = 0;
+            for (int i = 0; i < b.n; i++) {
+                pedge *e = &b.e[i];
+                if (e->y0 == e->y1) continue;
+                int dir = e->y1 > e->y0 ? 1 : -1;
+                float ya = dir > 0 ? e->y0 : e->y1, yb = dir > 0 ? e->y1 : e->y0;
+                if (sy < ya || sy >= yb) continue;
+                xs[nx].x = e->x0 + (sy - e->y0) * (e->x1 - e->x0) / (e->y1 - e->y0);
+                xs[nx++].dir = dir;
+            }
+            qsort(xs, nx, sizeof *xs, xing_cmp);
+            int wind = 0;
+            for (int i = 0; i + 1 < nx; i++) {
+                wind += xs[i].dir;
+                int inside = evenodd ? (i + 1) & 1 : wind != 0;
+                if (!inside) continue;
+                float xa = xs[i].x < 0 ? 0 : xs[i].x, xb = xs[i + 1].x > w ? w : xs[i + 1].x;
+                if (xb <= xa) continue;
+                int ia = (int)xa, ib = (int)xb;
+                if (ia == ib) { acc[ia] += xb - xa; continue; }
+                acc[ia] += ia + 1 - xa;
+                for (int k = ia + 1; k < ib; k++) acc[k] += 1;
+                acc[ib] += xb - ib;
+            }
+        }
+        for (int x = 0; x < w; x++) {
+            int v = (int)(acc[x] * 255.0f / SS + 0.5f);
+            m->a[y * w + x] = v > 255 ? 255 : (uint8_t)v;
+        }
+    }
+    free(acc); free(xs); free(b.e);
+    return 0;
+}
+
+void mask_free(mask *m) { free(m->a); m->a = NULL; m->w = m->h = 0; }
+
+void gfx_mask(canvas *c, const mask *m, int x, int y, uint32_t col) {
+    if (!m || !m->a) return;
+    for (int j = 0; j < m->h; j++) {
+        int yy = y + j;
+        if (yy < c->cy0 || yy >= c->cy1) continue;
+        for (int i = 0; i < m->w; i++) {
+            int xx = x + i;
+            if (xx < c->cx0 || xx >= c->cx1) continue;
+            uint8_t a = m->a[j * m->w + i];
+            if (a) blend(&c->px[yy * c->stride + xx], col, a);
+        }
+    }
+}
+
 // ---------------- text ----------------
 static stbtt_fontinfo fonts[FONT_COUNT];
 static unsigned char *font_data[FONT_COUNT];
+static int font_css[FONT_COUNT];
 
-int font_load(int face, const char *path) {
+static float face_scale(int face, float size) {
+    return font_css[face] ? stbtt_ScaleForMappingEmToPixels(&fonts[face], size)
+                          : stbtt_ScaleForPixelHeight(&fonts[face], size);
+}
+
+int font_load(int face, const char *path, int css_px) {
+    font_css[face] = css_px;
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
@@ -196,7 +393,7 @@ int font_load(int face, const char *path) {
 
 typedef struct {
     uint32_t key_cp; uint16_t key_size; uint8_t key_face, used;
-    int w, h, xoff, yoff;
+    int gi, w, h, xoff, yoff;
     float adv;
     uint8_t *bmp;
 } glyph;
@@ -212,12 +409,13 @@ static glyph *get_glyph(int face, float size, uint32_t cp) {
         if (g->used && g->key_cp == cp && g->key_size == sz && g->key_face == face) return g;
         if (!g->used) {
             stbtt_fontinfo *fi = &fonts[face];
-            float sc = stbtt_ScaleForPixelHeight(fi, size);
+            float sc = face_scale(face, size);
             int gi = stbtt_FindGlyphIndex(fi, cp);
             if (gi == 0 && cp != ' ') gi = stbtt_FindGlyphIndex(fi, '?');
             int adv, lsb;
             stbtt_GetGlyphHMetrics(fi, gi, &adv, &lsb);
             g->used = 1; g->key_cp = cp; g->key_size = sz; g->key_face = (uint8_t)face;
+            g->gi = gi;
             g->adv = adv * sc;
             g->bmp = stbtt_GetGlyphBitmap(fi, sc, sc, gi, &g->w, &g->h, &g->xoff, &g->yoff);
             return g;
@@ -239,22 +437,42 @@ static uint32_t utf8_next(const char **s) {
 float font_ascent(int face, float size) {
     int a, d, l;
     stbtt_GetFontVMetrics(&fonts[face], &a, &d, &l);
-    return a * stbtt_ScaleForPixelHeight(&fonts[face], size);
+    return a * face_scale(face, size);
+}
+
+float font_baseline(int face, float size, float line_h) {
+    int a, d, l;
+    stbtt_GetFontVMetrics(&fonts[face], &a, &d, &l);
+    float sc = face_scale(face, size);
+    if (line_h <= 0) line_h = (a - d + l) * sc;
+    return (line_h - (a - d) * sc) / 2 + a * sc;
+}
+
+// kerning between two glyphs (css faces only)
+static float kern(int face, float size, const glyph *prev, const glyph *g) {
+    if (!font_css[face] || !prev || !g) return 0;
+    int k = stbtt_GetGlyphKernAdvance(&fonts[face], prev->gi, g->gi);
+    return k ? k * face_scale(face, size) : 0;
 }
 
 int text_width(int face, float size, const char *s) {
     float w = 0;
+    glyph *prev = NULL;
     while (*s) {
         glyph *g = get_glyph(face, size, utf8_next(&s));
-        if (g) w += g->adv;
+        if (g) w += g->adv + kern(face, size, prev, g);
+        prev = g;
     }
     return (int)ceilf(w);
 }
 
 static float draw_run(canvas *c, int face, float size, float x, float y, const char *s, const char *end, uint32_t col) {
+    glyph *prev = NULL;
     while (*s && (!end || s < end)) {
         glyph *g = get_glyph(face, size, utf8_next(&s));
         if (!g) continue;
+        x += kern(face, size, prev, g);
+        prev = g;
         int gx = (int)lroundf(x) + g->xoff, gy = (int)lroundf(y) + g->yoff;
         for (int j = 0; j < g->h; j++) {
             int yy = gy + j;

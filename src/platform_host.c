@@ -19,6 +19,7 @@ static int audio_rate;
 static int frame_no;
 const char *host_shot_path; // if set, next present writes a PNG here
 uint32_t host_buttons;      // set by test driver
+int host_touch_down, host_touch_x, host_touch_y; // ditto
 int host_realtime_audio = 1;
 
 int plat_init(void) { return 0; }
@@ -37,6 +38,7 @@ void plat_display_on(void) { fprintf(stderr, "[host] display on\n"); }
 void plat_keep_awake(void) {}
 int plat_focus_event(void) { return 0; }
 uint32_t plat_buttons(void) { return host_buttons; }
+int plat_touch(int *x, int *y) { *x = host_touch_x; *y = host_touch_y; return host_touch_down; }
 
 uint64_t plat_time_us(void) {
     struct timespec t;
