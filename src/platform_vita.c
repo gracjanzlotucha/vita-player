@@ -4,6 +4,7 @@
 #include <psp2/kernel/sysmem.h>
 #include <psp2/display.h>
 #include <psp2/ctrl.h>
+#include <psp2/touch.h>
 #include <psp2/audioout.h>
 #include <psp2/power.h>
 #include <psp2/rtc.h>
@@ -41,6 +42,7 @@ int plat_init(void) {
     }
     render_buf = (uint32_t *)memalign(64, SCREEN_W * SCREEN_H * 4);
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
     // Decoding FLAC is cheap, but give the UI headroom for cover art scaling.
     scePowerSetArmClockFrequency(333);
     return 0;
@@ -79,6 +81,7 @@ void plat_display_off(void) {
     if (sceRegMgrGetKeyInt("/CONFIG/DISPLAY", "brightness", &b) >= 0 && b > 0) saved_brightness = b;
     int r = sceAVConfigSetDisplayBrightness(0);
     plat_log("display off: saved brightness %d, set 0 -> 0x%08X", saved_brightness, r);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_STOP); // pocket: no stray touches
     display_is_off = 1;
 }
 
@@ -92,6 +95,7 @@ void plat_display_on(void) {
     }
     int r = sceAVConfigSetDisplayBrightness(b);
     plat_log("display on: brightness %d -> 0x%08X", b, r);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
     display_is_off = 0;
 }
 
@@ -131,6 +135,16 @@ uint32_t plat_buttons(void) {
     if (s & SCE_CTRL_START) b |= BTN_START;
     if (s & SCE_CTRL_SELECT) b |= BTN_SELECT;
     return b;
+}
+
+// The front panel reports 1920x1088; the screen is 960x544.
+int plat_touch(int *x, int *y) {
+    SceTouchData t;
+    memset(&t, 0, sizeof t);
+    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &t, 1) < 0 || t.reportNum == 0) return 0;
+    *x = t.report[0].x * SCREEN_W / 1920;
+    *y = t.report[0].y * SCREEN_H / 1088;
+    return 1;
 }
 
 uint64_t plat_time_us(void) { return sceKernelGetProcessTimeWide(); }

@@ -29,6 +29,20 @@ screen-off mode for pocket listening.
 
 With the screen off only START, L, R and SELECT do anything.
 
+### Touch
+Everything can also be done on the touch screen:
+
+- **Library:** tap a folder to open it, tap a track to play it. Drag the list
+  to scroll; flick it to scroll fast. Tap the mini player to open Now playing,
+  or its round button to play / pause.
+- **Now playing:** tap shuffle, previous, play / pause, next or repeat. Tap or
+  drag along the progress bar to seek (it jumps when you lift your finger).
+- **Hint bar:** each hint along the bottom (Back, Play all, Library, Screen
+  off, …) is a button.
+
+Touch is ignored while the screen is off, so nothing happens in a pocket.
+After a touch scroll, the first D-pad press brings the selection back on screen.
+
 ## What "lossless" means here
 The Vita's audio output is 16-bit. Fidelity uses the system's BGM audio port,
 which accepts 44.1 kHz and 48 kHz natively, so:

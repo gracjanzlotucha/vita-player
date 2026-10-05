@@ -52,6 +52,55 @@ static char settings_path[512];
 #define LIST_Y 80
 #define LIST_ROWS 7
 
+static float list_y;   // browser scroll offset in pixels (touch scrolls smoothly)
+static float list_vel; // fling speed, px/s
+
+// ---------------------------------------------------------------- touch
+// Every tap ends up as a virtual button press for one tick, so touch and
+// buttons share the same code paths. Draw code registers what is tappable
+// as it draws, so hit areas always match what is on screen.
+enum { Z_BUTTON, Z_LIST, Z_SEEK };
+typedef struct { float x, y, w, h; int kind; uint32_t btn; } zone;
+static zone zones[24];
+static int nzones;
+
+static struct {
+    int down, moved, caught, blocked;
+    zone z;                 // zone under the finger when it went down
+    float x0, y0, x, y;     // start / current position
+    float vel;              // list drag speed, px/s
+    uint64_t t_move;
+} tc;
+static float scrub = -1;    // 0..1 while a finger is on the progress bar
+static uint64_t last_tick;
+
+#define TAP_SLOP 12
+
+static int in_zone(const zone *z, float x, float y) {
+    return x >= z->x && x < z->x + z->w && y >= z->y && y < z->y + z->h;
+}
+
+// Register a tappable area. r >= 0 draws a pressed highlight with that
+// corner radius while the finger is on it, so call it before drawing the
+// control itself.
+static void hot(float x, float y, float w, float h, float r, int kind, uint32_t btn) {
+    if (nzones < (int)(sizeof zones / sizeof *zones)) zones[nzones++] = (zone){ x, y, w, h, kind, btn };
+    if (r >= 0 && tc.down && !tc.blocked && tc.z.kind == kind && tc.z.btn == btn &&
+        tc.z.x == x && tc.z.y == y && in_zone(&tc.z, tc.x, tc.y))
+        gfx_rrect(&cv, x, y, w, h, r, WITH_ALPHA(C_TEXT, 26));
+}
+
+static int list_row_at(float y) {
+    int r = (int)floorf((y - LIST_Y + list_y) / ROW_H);
+    return r >= 0 && r < dv.n ? r : -1;
+}
+
+// list row under a resting finger (-1 once it starts scrolling)
+static int pressed_row(void) {
+    if (!tc.down || tc.blocked || tc.z.kind != Z_LIST || tc.moved || tc.caught) return -1;
+    return list_row_at(tc.y);
+}
+
 // ---------------------------------------------------------------- settings
 static void save_settings(void) {
     player_status s;
@@ -173,6 +222,12 @@ static void draw_hints(const hint *h, int n) {
     }
     float x = SCREEN_W - 32 - total;
     for (int i = 0; i < n; i++) {
+        // single-button hints double as touch buttons
+        if (!(h[i].btn & (h[i].btn - 1))) {
+            int gw = h[i].btn == BTN_START || h[i].btn == BTN_SELECT ? text_width(FONT_SEMIBOLD, 11, h[i].btn == BTN_START ? "START" : "SELECT") + 12 : 18;
+            float w = gw + 6 + text_width(FONT_REGULAR, 14, h[i].label);
+            hot(x - 10, SCREEN_H - 36, w + 20, 32, 16, Z_BUTTON, h[i].btn);
+        }
         x += btn_glyph(x, y, h[i].btn) + 6;
         x += text_draw(&cv, FONT_REGULAR, 14, x, y + 5, h[i].label, C_TEXT2, 0) + 22;
     }
@@ -269,15 +324,20 @@ static void draw_browser(const player_status *s) {
         int w = text_width(FONT_REGULAR, 18, msg);
         text_draw(&cv, FONT_REGULAR, 18, (SCREEN_W - w) / 2.0f, LIST_Y + 150, msg, C_TEXT3, 0);
     }
+    if (dv.n) hot(0, LIST_Y, SCREEN_W, list_bottom - LIST_Y, -1, Z_LIST, 0);
     gfx_clip(&cv, 0, LIST_Y, SCREEN_W, list_bottom - LIST_Y);
-    for (int i = 0; i < LIST_ROWS && dv.scroll + i < dv.n; i++) {
-        int idx = dv.scroll + i;
+    int first = (int)(list_y / ROW_H);
+    float off = list_y - first * ROW_H;
+    for (int i = 0; i <= LIST_ROWS && first + i < dv.n; i++) {
+        int idx = first + i;
         lib_entry *e = &dv.items[idx];
-        float y = LIST_Y + i * ROW_H;
+        float y = LIST_Y + i * ROW_H - off;
         int sel = idx == dv.sel;
         if (sel) {
             gfx_rrect(&cv, 24, y + 3, SCREEN_W - 48, ROW_H - 6, 12, C_RAISED);
             gfx_rrect(&cv, 24, y + 15, 4, ROW_H - 30, 2, C_ACCENT);
+        } else if (idx == pressed_row()) {
+            gfx_rrect(&cv, 24, y + 3, SCREEN_W - 48, ROW_H - 6, 12, WITH_ALPHA(C_TEXT, 14));
         }
         uint32_t ic = sel ? C_ACCENT : C_TEXT3;
         if (!dv.path[0]) icon_device(44, y + 14, 24, ic);
@@ -326,13 +386,14 @@ static void draw_browser(const player_status *s) {
         float track_h = ROW_H * LIST_ROWS - 12;
         float th = track_h * LIST_ROWS / dv.n;
         if (th < 24) th = 24;
-        float ty = LIST_Y + 6 + (track_h - th) * dv.scroll / (float)(dv.n - LIST_ROWS);
+        float ty = LIST_Y + 6 + (track_h - th) * list_y / ((dv.n - LIST_ROWS) * ROW_H);
         gfx_rrect(&cv, SCREEN_W - 14, ty, 4, th, 2, WITH_ALPHA(C_TEXT, 50));
     }
 
     // mini player
     float my = SCREEN_H - 40 - 70;
     gfx_rrect(&cv, 24, my, SCREEN_W - 48, 62, 14, C_SURFACE);
+    hot(24, my, SCREEN_W - 48, 62, 14, Z_BUTTON, BTN_TRIANGLE);
     if (s->has_track) {
         if (cover_small.px) gfx_image(&cv, &cover_small, 31, (int)my + 7, 8, 255);
         else placeholder_cover(31, my + 7, 48, 8);
@@ -345,6 +406,7 @@ static void draw_browser(const player_status *s) {
         snprintf(t, sizeof t, "%s / %s", a, b);
         int tw = text_width(FONT_REGULAR, 14, t);
         text_draw(&cv, FONT_REGULAR, 14, SCREEN_W - 100 - tw, my + 38, t, C_TEXT2, 0);
+        hot(SCREEN_W - 94, my, 60, 62, 30, Z_BUTTON, BTN_START);
         gfx_circle(&cv, SCREEN_W - 64, my + 31, 18, C_ACCENT);
         if (s->paused) icon_play(SCREEN_W - 62, my + 31, 14, C_ACCENT_DK);
         else icon_pause(SCREEN_W - 64, my + 31, 13, C_ACCENT_DK);
@@ -419,14 +481,17 @@ static void draw_playing(const player_status *s) {
     // progress
     float py = 300;
     float frac = s->total ? (float)s->pos / s->total : 0;
+    uint64_t pos = s->pos;
+    if (scrub >= 0 && s->total) { frac = scrub; pos = (uint64_t)(scrub * s->total); }
     if (frac > 1) frac = 1;
     gfx_rrect(&cv, x, py, w, 6, 3, WITH_ALPHA(C_TEXT, 36));
     if (s->has_track) {
+        hot(x - 16, py - 22, w + 32, 50, -1, Z_SEEK, 0);
         if (frac > 0) gfx_rrect(&cv, x, py, w * frac, 6, 3, C_ACCENT);
-        gfx_circle(&cv, x + w * frac, py + 3, 8, C_TEXT);
+        gfx_circle(&cv, x + w * frac, py + 3, scrub >= 0 ? 11 : 8, C_TEXT);
         char a[16], b[16];
-        fmt_time(a, sizeof a, s->pos, s->rate);
-        uint64_t rem = s->total > s->pos ? s->total - s->pos : 0;
+        fmt_time(a, sizeof a, pos, s->rate);
+        uint64_t rem = s->total > pos ? s->total - pos : 0;
         b[0] = '-';
         fmt_time(b + 1, sizeof b - 1, rem, s->rate);
         text_draw(&cv, FONT_REGULAR, 14, x, py + 30, a, C_TEXT2, 0);
@@ -436,6 +501,8 @@ static void draw_playing(const player_status *s) {
 
     // transport
     float ty = 400, mid = x + w / 2;
+    static const uint32_t tbtn[5] = { BTN_SQUARE, BTN_L, BTN_CROSS, BTN_R, BTN_TRIANGLE };
+    for (int i = 0; i < 5; i++) hot(mid + (i - 2) * 95 - 42, ty - 42, 84, 84, 42, Z_BUTTON, tbtn[i]);
     uint32_t sh = s->shuffle ? C_ACCENT : WITH_ALPHA(C_TEXT, 120);
     icon_shuffle(mid - 190, ty, 22, sh);
     if (s->shuffle) gfx_circle(&cv, mid - 190, ty + 22, 2.5f, C_ACCENT);
@@ -472,6 +539,7 @@ static void render(const player_status *s) {
     int stride;
     uint32_t *px = plat_backbuffer(&stride);
     gfx_begin(&cv, px, SCREEN_W, SCREEN_H, stride);
+    nzones = 0;
     if (view == VIEW_BROWSER) draw_browser(s);
     else draw_playing(s);
     draw_toast();
@@ -490,12 +558,35 @@ static int pressed(uint32_t b, uint32_t now, int repeat) {
     return 0;
 }
 
+static float max_scroll(void) { return dv.n > LIST_ROWS ? (float)(dv.n - LIST_ROWS) * ROW_H : 0; }
+
+static int clamp_list_y(void) {
+    float m = max_scroll();
+    if (list_y < 0) { list_y = 0; return 1; }
+    if (list_y > m) { list_y = m; return 1; }
+    return 0;
+}
+
+// scroll so the selection is on screen (buttons)
 static void clamp_scroll(void) {
     if (dv.sel < 0) dv.sel = 0;
     if (dv.sel >= dv.n) dv.sel = dv.n ? dv.n - 1 : 0;
-    if (dv.sel < dv.scroll) dv.scroll = dv.sel;
-    if (dv.sel >= dv.scroll + LIST_ROWS) dv.scroll = dv.sel - LIST_ROWS + 1;
-    if (dv.scroll < 0) dv.scroll = 0;
+    if (dv.sel * ROW_H < list_y) list_y = (float)dv.sel * ROW_H;
+    if ((dv.sel + 1) * ROW_H > list_y + LIST_ROWS * ROW_H) list_y = (float)(dv.sel + 1 - LIST_ROWS) * ROW_H;
+    clamp_list_y();
+    list_vel = 0;
+}
+
+// Touch scrolling leaves the selection where it was, even off screen.
+// The first button press afterwards moves it to the nearest visible row.
+static int reveal_selection(void) {
+    if (!dv.n) return 0;
+    int top = (int)ceilf(list_y / ROW_H - 0.01f);
+    int bottom = (int)floorf((list_y + LIST_ROWS * ROW_H) / ROW_H + 0.01f) - 1;
+    int old = dv.sel;
+    if (dv.sel < top) dv.sel = top;
+    if (dv.sel > bottom) dv.sel = bottom;
+    return dv.sel != old;
 }
 
 static void open_dir(const char *path, const char *select_name) {
@@ -505,7 +596,7 @@ static void open_dir(const char *path, const char *select_name) {
     }
     if (select_name)
         for (int i = 0; i < dv.n; i++) if (!strcmp(dv.items[i].name, select_name)) { dv.sel = i; break; }
-    dv.scroll = dv.sel - LIST_ROWS / 2;
+    list_y = (float)(dv.sel - LIST_ROWS / 2) * ROW_H;
     clamp_scroll();
     save_settings();
     dirty = 1;
@@ -526,6 +617,91 @@ static void play_folder(const char *dir, const char *start_file, int recursive) 
     }
 }
 
+static const zone *zone_at(float x, float y) {
+    for (int i = nzones - 1; i >= 0; i--) if (in_zone(&zones[i], x, y)) return &zones[i];
+    return NULL;
+}
+
+static float seek_frac(float x) {
+    float f = (x - (tc.z.x + 16)) / (tc.z.w - 32);
+    return f < 0 ? 0 : f > 1 ? 1 : f;
+}
+
+// Returns buttons to inject this tick.
+static uint32_t handle_touch(const player_status *s) {
+    int x, y;
+    int down = plat_touch(&x, &y);
+    uint64_t now = plat_time_us();
+    uint32_t out = 0;
+
+    const zone *z = down && !tc.down && !tc.blocked ? zone_at(x, y) : NULL;
+    if (down && !tc.down && !tc.blocked && !z) { // dead area: ignore until lifted
+        tc.blocked = 1;
+        list_vel = 0;
+    }
+
+    if (tc.blocked) { // also a finger left over from screen-off / app switch
+        if (!down) tc.blocked = 0;
+        tc.down = 0;
+    } else if (down && !tc.down) {
+        memset(&tc, 0, sizeof tc);
+        tc.down = 1;
+        tc.z = *z;
+        tc.x0 = tc.x = x; tc.y0 = tc.y = y;
+        tc.t_move = now;
+        tc.caught = fabsf(list_vel) > 60; // finger stops a fling; that's not a tap
+        list_vel = 0;
+        if (z->kind == Z_SEEK) scrub = seek_frac(x);
+        dirty = 1;
+    } else if (down) {
+        float dy = y - tc.y;
+        if (fabsf(x - tc.x0) > TAP_SLOP || fabsf(y - tc.y0) > TAP_SLOP) tc.moved = 1;
+        if (tc.z.kind == Z_LIST && tc.moved && dy != 0) {
+            float dt = (now - tc.t_move) / 1e6f;
+            list_y -= dy;
+            clamp_list_y();
+            if (dt > 0) tc.vel = tc.vel * 0.6f + (-dy / dt) * 0.4f;
+            tc.t_move = now;
+        }
+        if (tc.z.kind == Z_SEEK) scrub = seek_frac(x);
+        if (x != tc.x || y != tc.y) dirty = 1;
+        tc.x = x; tc.y = y;
+    } else if (tc.down) {
+        tc.down = 0;
+        dirty = 1;
+        switch (tc.z.kind) {
+        case Z_SEEK:
+            if (s->has_track && s->total) player_seek_to((uint64_t)(scrub * s->total));
+            scrub = -1;
+            break;
+        case Z_LIST:
+            if (tc.moved) {
+                // fling, unless the finger rested before lifting
+                if (now - tc.t_move < 80000 && fabsf(tc.vel) > 150) list_vel = tc.vel;
+            } else if (!tc.caught && list_row_at(tc.y) >= 0) {
+                dv.sel = list_row_at(tc.y);
+                out = BTN_CROSS;
+            }
+            break;
+        case Z_BUTTON:
+            if (in_zone(&tc.z, tc.x, tc.y)) out = tc.z.btn;
+            break;
+        }
+    }
+
+    // fling momentum
+    if (!tc.down && list_vel != 0) {
+        float dt = (now - last_tick) / 1e6f;
+        if (dt > 0.05f) dt = 0.05f;
+        list_y += list_vel * dt;
+        list_vel *= expf(-4.0f * dt);
+        if (clamp_list_y() || fabsf(list_vel) < 30) list_vel = 0;
+        dirty = 1;
+    }
+    last_tick = now;
+    return out;
+}
+
 static void handle_input(uint32_t b, player_status *s) {
     // global
     if (pressed(BTN_START, b, 0)) { player_toggle_pause(); dirty = 1; }
@@ -533,11 +709,18 @@ static void handle_input(uint32_t b, player_status *s) {
     if (pressed(BTN_R, b, 0)) { player_next(); dirty = 1; }
 
     if (view == VIEW_BROWSER) {
-        if (pressed(BTN_UP, b, 1)) { dv.sel--; if (dv.sel < 0) dv.sel = dv.n - 1; clamp_scroll(); dirty = 1; }
-        if (pressed(BTN_DOWN, b, 1)) { dv.sel++; if (dv.sel >= dv.n) dv.sel = 0; clamp_scroll(); dirty = 1; }
-        if (pressed(BTN_LEFT, b, 1)) { dv.sel -= LIST_ROWS; clamp_scroll(); dirty = 1; }
-        if (pressed(BTN_RIGHT, b, 1)) { dv.sel += LIST_ROWS; clamp_scroll(); dirty = 1; }
-        if (pressed(BTN_CROSS, b, 0) && dv.n) {
+        int up = pressed(BTN_UP, b, 1), down = pressed(BTN_DOWN, b, 1);
+        int left = pressed(BTN_LEFT, b, 1), right = pressed(BTN_RIGHT, b, 1);
+        int cross = pressed(BTN_CROSS, b, 0);
+        if ((up || down || left || right || cross) && reveal_selection()) {
+            up = down = left = right = cross = 0;
+            dirty = 1;
+        }
+        if (up) { dv.sel--; if (dv.sel < 0) dv.sel = dv.n - 1; clamp_scroll(); dirty = 1; }
+        if (down) { dv.sel++; if (dv.sel >= dv.n) dv.sel = 0; clamp_scroll(); dirty = 1; }
+        if (left) { dv.sel -= LIST_ROWS; clamp_scroll(); dirty = 1; }
+        if (right) { dv.sel += LIST_ROWS; clamp_scroll(); dirty = 1; }
+        if (cross && dv.n) {
             lib_entry *e = &dv.items[dv.sel];
             char full[1024];
             if (!dv.path[0]) snprintf(full, sizeof full, "%s", e->name);
@@ -615,10 +798,14 @@ int app_step(uint32_t b) {
 
     // Never leave the backlight at 0 if the user jumps out (PS button)
     // or the console wakes from sleep.
-    if (plat_focus_event() && screen_off) {
-        screen_off = 0;
-        plat_display_on();
-        dirty = 1;
+    if (plat_focus_event()) {
+        tc.blocked = 1;
+        scrub = -1;
+        if (screen_off) {
+            screen_off = 0;
+            plat_display_on();
+            dirty = 1;
+        }
     }
 
     if (screen_off) {
@@ -629,6 +816,7 @@ int app_step(uint32_t b) {
         if (pressed(BTN_SELECT, b, 0)) {
             screen_off = 0;
             plat_display_on();
+            tc.blocked = 1;
             dirty = 1;
         }
         prev_buttons = b;
@@ -636,8 +824,14 @@ int app_step(uint32_t b) {
         return 0;
     }
 
+    b |= handle_touch(&s);
+
     if (pressed(BTN_SELECT, b, 0)) {
         screen_off = 1;
+        tc.down = 0;
+        tc.blocked = 1;
+        scrub = -1;
+        list_vel = 0;
         // black frame first so nothing flashes when it comes back
         int stride;
         uint32_t *px = plat_backbuffer(&stride);

@@ -36,6 +36,7 @@ target_link_libraries(${PROJECT_NAME}
   m
   SceDisplay_stub
   SceCtrl_stub
+  SceTouch_stub
   SceAudio_stub
   ScePower_stub
   SceRtc_stub

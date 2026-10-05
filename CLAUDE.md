@@ -19,6 +19,8 @@ from the memory card. See README.md for controls and the user-facing feature lis
 
 ## Not yet verified on hardware
 - Battery drain over long screen-off listening.
+- Touch controls (front panel coordinates assumed 1920x1088 → halved to 960x544;
+  touch sampling is stopped while the screen is off).
 - Whether the BGM port ever refuses to open (there is a MAIN-port 48 kHz fallback).
 
 ## Architecture
@@ -30,6 +32,10 @@ from the memory card. See README.md for controls and the user-facing feature lis
   or windowed-sinc resample + dither (88.2k/96k/192k). Next track is chained into
   the same output buffer, so same-rate tracks are gapless.
 - `app.c`: both screens (library, now playing), input, screen-off mode, settings.
+  Touch: draw code registers tappable zones with `hot()` as it draws; a tap
+  becomes a one-tick virtual button press, so touch reuses the button handlers.
+  Exceptions are list drag/fling scrolling (`list_y`, pixels) and progress-bar
+  scrubbing (`player_seek_to` on release).
 - `gfx.c`: software renderer (anti-aliased SDF shapes, images, stb_truetype text)
   into a RAM buffer that is copied to a CDRAM framebuffer on present.
 
@@ -45,6 +51,7 @@ gcc -O2 -Ithird_party/dr_libs -Ithird_party/stb src/app.c src/gfx.c src/player.c
   src/stbiw_impl.c -o host_test -lm -lpthread
 HOST_ROOT=/path/to/music ./host_test x ./shots            # scripted screenshots
 HOST_ROOT=/path/to/album HOST_WAV=out.wav SCRIPT=audio ./host_test x .  # render audio
+HOST_ROOT=/path/to/music SCRIPT=touch ./host_test x ./shots  # scripted touch gestures
 ```
 Bit-exactness check: decode the same files with ffmpeg to s16le and compare bytes.
 

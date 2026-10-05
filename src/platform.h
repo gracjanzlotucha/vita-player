@@ -29,6 +29,9 @@ int  plat_focus_event(void);
 
 // Input
 uint32_t plat_buttons(void);
+// Front touch screen: 1 while a finger is down, position in screen pixels.
+// Only the first finger is reported.
+int  plat_touch(int *x, int *y);
 
 // Time
 uint64_t plat_time_us(void);
