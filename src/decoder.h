@@ -12,6 +12,7 @@ typedef struct decoder {
     uint64_t total_frames;  // 0 if unknown
     int mp3_seek_ready;
     void *aux;              // MP3 seek table
+    void *file;             // our buffered FILE (FLAC/WAV/MP3)
 } decoder;
 
 audio_format format_from_name(const char *name);
@@ -22,3 +23,10 @@ void decoder_close(decoder *d);
 // Returns frames read, 0 at end.
 uint32_t decoder_read(decoder *d, int32_t *out, uint32_t n);
 int  decoder_seek(decoder *d, uint64_t frame);
+
+// MP3 seek index, built off the audio thread (it reads the whole file).
+// total gets the exact length when the file has no Xing/Info header.
+void *decoder_mp3_index(const char *path, uint64_t *total);
+// Hands an index to an open MP3 decoder (takes ownership).
+void decoder_mp3_use_index(decoder *d, void *index, uint64_t total);
+void decoder_mp3_index_free(void *index);

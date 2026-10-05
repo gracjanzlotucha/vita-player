@@ -24,14 +24,28 @@ from the memory card. See README.md for controls and the user-facing feature lis
 - Whether the BGM port ever refuses to open (there is a MAIN-port 48 kHz fallback).
 
 ## Architecture
+- Threads: UI = main thread (core 0); audio thread (prio 0x50, core 1); two
+  low-priority workers on core 2 — the track info loader (`app.c`) and the MP3
+  seek indexer (`player.c`). `plat_cpu_boost()` raises the clock 333 → 444 MHz
+  only while cover art is decoded.
 - `src/platform.h` is the only seam between app code and the console.
   `platform_vita.c` implements it with Vita APIs; `platform_host.c` is a desktop
   stand-in that writes frames to PNG and audio to WAV.
+- Decoders read through stdio with 128 KB buffers (`decoder.c`); tag/picture
+  reads go in 64 KB pieces so they never hold up the audio thread's reads.
+  MP3 length (without a Xing header) and seek tables come from the background
+  indexer; until then the UI shows `--:--` and a seek builds the table inline.
 - `player.c`: one high-priority audio thread. Decode → int32 stereo → either
   bit-exact >>16 (16-bit sources at a port-supported rate), TPDF dither (24-bit),
   or windowed-sinc resample + dither (88.2k/96k/192k). Next track is chained into
   the same output buffer, so same-rate tracks are gapless.
 - `app.c`: both screens (library, now playing), input, screen-off mode, settings.
+  Track changes never block the UI: `loader_thread` reads tags, decodes the
+  cover once (400 px; 48 px is scaled from it) and builds the background; the UI
+  collects results in `refresh_track()`. Art is keyed by a hash of the picture
+  bytes, so tracks sharing a cover skip all of it. Now playing draws its
+  per-track parts once into `np_static` and only the clock/timeline/controls
+  per frame.
   Touch: draw code registers tappable zones with `hot()` as it draws; a tap
   becomes a one-tick virtual button press, so touch reuses the button handlers.
   Exceptions are list drag/fling scrolling (`list_y`, pixels) and progress-bar

@@ -138,6 +138,12 @@ int main(int argc, char **argv) {
         touch(698, 416);
         shot("np06_pressed_play");
         lift();
+        tap(BTN_SQUARE);           // shuffle off
+        host_buttons = BTN_R; app_step(BTN_R); host_buttons = 0; app_step(0); // rapid skips,
+        host_buttons = BTN_L; app_step(BTN_L); host_buttons = 0; app_step(0); // no waiting
+        host_buttons = BTN_L; app_step(BTN_L); host_buttons = 0; app_step(0);
+        run_ms(300);
+        shot("np07_after_rapid_skips"); // Track 2, same cover throughout
     } else if (!strcmp(script, "audio")) {
         // play whole tree and let it run to the end, gapless check
         host_realtime_audio = 0;

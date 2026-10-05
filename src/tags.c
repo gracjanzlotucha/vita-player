@@ -18,6 +18,19 @@ static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 1
 static uint32_t le32(const uint8_t *p) { return (uint32_t)p[3] << 24 | p[2] << 16 | p[1] << 8 | p[0]; }
 static uint32_t syncsafe(const uint8_t *p) { return (p[0] & 0x7f) << 21 | (p[1] & 0x7f) << 14 | (p[2] & 0x7f) << 7 | (p[3] & 0x7f); }
 
+// Big reads (embedded pictures, ID3 tags) go in 64 KB pieces so the audio
+// thread's reads from the same memory card are never stuck behind one.
+static size_t fread_chunked(void *buf, size_t n, FILE *f) {
+    size_t done = 0;
+    while (done < n) {
+        size_t want = n - done > 65536 ? 65536 : n - done;
+        size_t got = fread((uint8_t *)buf + done, 1, want, f);
+        done += got;
+        if (got < want) break;
+    }
+    return done;
+}
+
 static void set_field(char *dst, const char *src, size_t n) {
     if (!src[0]) return;
     size_t i = 0;
@@ -80,7 +93,7 @@ static void read_flac(FILE *f, track_tags *t, int want_cover) {
         uint32_t len = (uint32_t)h[1] << 16 | h[2] << 8 | h[3];
         if (type == 4 || (type == 6 && want_cover)) {
             uint8_t *b = malloc(len);
-            if (!b || fread(b, 1, len, f) != len) { free(b); return; }
+            if (!b || fread_chunked(b, len, f) != len) { free(b); return; }
             if (type == 4 && len >= 8) {
                 uint32_t p = 4 + le32(b);               // skip vendor
                 if (p + 4 <= len) {
@@ -157,7 +170,7 @@ static void read_id3(FILE *f, track_tags *t, int want_cover) {
     uint32_t size = syncsafe(h + 6);
     if (size > 32 * 1024 * 1024) return;
     uint8_t *b = malloc(size);
-    if (!b || fread(b, 1, size, f) != size) { free(b); return; }
+    if (!b || fread_chunked(b, size, f) != size) { free(b); return; }
     uint32_t p = 0;
     if (h[5] & 0x40 && ver >= 3) p += (ver == 4 ? syncsafe(b) : be32(b) + 4); // extended header
     while (p + (ver == 2 ? 6 : 10) <= size) {
@@ -220,7 +233,7 @@ static void folder_cover(const char *path, track_tags *t) {
             fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
             if (sz > 0 && sz < 32 * 1024 * 1024) {
                 t->cover_data = malloc(sz);
-                if (fread(t->cover_data, 1, sz, f) == (size_t)sz) t->cover_size = sz;
+                if (fread_chunked(t->cover_data, sz, f) == (size_t)sz) t->cover_size = sz;
                 else { free(t->cover_data); t->cover_data = NULL; }
             }
             fclose(f);
@@ -291,6 +304,29 @@ int image_from_cover(const uint8_t *data, size_t n, int size, image *out) {
         }
     }
     stbi_image_free(src);
+    return 0;
+}
+
+// Area-average downscale of a square image (e.g. the 48 px thumbnail from
+// the 400 px cover, instead of decoding the file a second time).
+int image_scale(const image *src, int size, image *out) {
+    if (!src->px || src->w < size) return -1;
+    out->w = out->h = size;
+    out->px = malloc(size * size * 4);
+    if (!out->px) return -1;
+    for (int y = 0; y < size; y++) {
+        int y0 = y * src->h / size, y1 = (y + 1) * src->h / size;
+        for (int x = 0; x < size; x++) {
+            int x0 = x * src->w / size, x1 = (x + 1) * src->w / size;
+            uint32_t r = 0, g = 0, b = 0, n = 0;
+            for (int yy = y0; yy < y1; yy++)
+                for (int xx = x0; xx < x1; xx++, n++) {
+                    uint32_t p = src->px[yy * src->w + xx];
+                    r += p & 255; g += (p >> 8) & 255; b += (p >> 16) & 255;
+                }
+            out->px[y * size + x] = (r / n) | (g / n) << 8 | (b / n) << 16 | 0xFF000000u;
+        }
+    }
     return 0;
 }
 

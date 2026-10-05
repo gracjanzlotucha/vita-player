@@ -18,5 +18,6 @@ void tags_free(track_tags *t);
 
 // Decodes cover bytes and scales to size x size (center-cropped square).
 int  image_from_cover(const uint8_t *data, size_t n, int size, image *out);
+int  image_scale(const image *src, int size, image *out); // square, downscale only
 void image_free(image *img);
 uint32_t image_average(const image *img); // RGBA
