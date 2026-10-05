@@ -16,6 +16,8 @@ from the memory card. See README.md for controls and the user-facing feature lis
   call `sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT)` every loop.
 - On PS button / resume from sleep (`sceAppMgrReceiveSystemEvent`) the backlight is
   restored so the user never lands on a dark home screen.
+- Track changes and scrubbing are fast since the background loader / cached
+  Now playing layer / MP3 indexer work (PR #2) — confirmed by the user on hardware.
 
 ## Not yet verified on hardware
 - Battery drain over long screen-off listening.
@@ -64,7 +66,7 @@ from the memory card. See README.md for controls and the user-facing feature lis
   `np_text()` positions text by its Figma line-box top. Inter faces keep the old
   sizing until the library is redesigned.
 - The Now playing background (blurred, saturated cover at 20%) is built once per
-  track in `build_np_bg()` and blitted each frame.
+  track by `build_bg()` on the loader thread and copied into `np_static`.
 - Not in the Figma frame, so designed to match: pause icon, active
   shuffle/repeat pill, repeat-one badge, "Not Playing" state, the hint row in
   the bottom panel, toast.
