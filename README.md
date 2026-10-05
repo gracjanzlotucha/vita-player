@@ -5,40 +5,45 @@ screen-off mode for pocket listening.
 
 ## Install
 1. Copy `Fidelity.vpk` to the Vita (VitaShell → FTP or USB).
-2. Install it with VitaShell (✕ on the file).
-3. Put music anywhere on `ux0:` (e.g. `ux0:music/Artist/Album/…`).
-   SD2Vita via StorageMgr/YAMT normally mounts as `ux0:`. Other mounts
-   (`uma0:`, `imc0:` …) show up if you press ○ at the top of `ux0:`.
+2. Install it with VitaShell (✕ on the file) and start it once — that creates
+   the music folder.
+3. Copy your music into **`ux0:data/Fidelity/Music`** (any folder layout).
+   The library is built from tags: albums, artists and tracks are found
+   automatically. New or changed files are picked up on every start, or with
+   Settings → Rescan Library.
+
+The first scan reads every file and can take a while for a big library (it
+runs in the background and the list fills in as it goes). After that only
+new or changed files are read. Album thumbnails are made the first time
+they're shown and cached in `ux0:data/Fidelity/cache`.
 
 ## Controls
 | Where | Button | Action |
 |---|---|---|
 | Everywhere | START | Play / pause |
-| | L / R | Previous / next track |
 | | SELECT | Screen off (SELECT again to wake) |
-| Library | ↑ ↓ / ← → | Move / page |
-| | ✕ | Open folder, or play this file (queues the folder) |
-| | ○ | Up one folder |
-| | □ | Play everything in the selected (or current) folder, incl. subfolders |
+| Library | L / R | Change tab (Albums, Tracks, Artists, Settings) |
+| | ↑ ↓ / ← → | Move / page |
+| | ✕ | Open the album or artist, play the track |
+| | ○ | Back (album / artist page) |
+| | □ | Shuffle the album (album page) |
 | | △ | Now playing |
 | Now playing | ✕ | Play / pause |
+| | L / R | Previous / next track |
 | | ← → | Seek −/+ 10 s (hold to repeat) |
 | | □ | Shuffle |
 | | △ | Repeat: off → all → one |
-| | ○ | Back to library |
+| | ○ | Back |
 
-With the screen off only START, L, R and SELECT do anything.
+With the screen off only START, L, R (previous / next) and SELECT do anything.
 
 ### Touch
-Everything can also be done on the touch screen:
-
-- **Library:** tap a folder to open it, tap a track to play it. Drag the list
-  to scroll; flick it to scroll fast. Tap the mini player to open Now playing,
-  or its round button to play / pause.
-- **Now playing:** tap shuffle, previous, play / pause, next or repeat. Tap or
-  drag along the progress bar to seek (it jumps when you lift your finger).
-- **Hint bar:** each hint along the bottom (Back, Play all, Library, Screen
-  off, …) is a button.
+Everything can also be done on the touch screen: tap a tab, an album, artist
+or track; drag the list to scroll, flick it to scroll fast. The mini player at
+the bottom of the library opens Now playing, and its buttons skip and
+play / pause. In Now playing, tap the controls, and tap or drag along the
+progress bar to seek (it jumps when you lift your finger). The hints along
+the bottom are buttons too.
 
 Touch is ignored while the screen is off, so nothing happens in a pocket.
 After a touch scroll, the first D-pad press brings the selection back on screen.
@@ -57,7 +62,8 @@ which accepts 44.1 kHz and 48 kHz natively, so:
 Cover art: embedded FLAC/MP3 pictures, otherwise `cover.jpg`, `folder.jpg`,
 `front.jpg` (or .png) in the album folder.
 
-Settings (last folder, shuffle, repeat) live in `ux0:data/Fidelity/settings.txt`.
+Settings (last tab, shuffle, repeat) live in `ux0:data/Fidelity/settings.txt`,
+the library index in `library.idx` next to it.
 A log is written to `ux0:data/Fidelity/log.txt` on each launch.
 
 ## Building
@@ -69,16 +75,16 @@ cmake .. && make
 ```
 
 `third_party/` holds dr_libs (FLAC/MP3/WAV), stb_vorbis, stb_image and
-stb_truetype. The UI fonts are Inter and Geist (both SIL Open Font License).
+stb_truetype. The UI fonts are Geist and Geist Pixel (SIL Open Font License).
 
 There is also a desktop test build (no Vita needed) that runs the same app
 code, writes screenshots to PNG and audio to WAV:
 
 ```
 gcc -O2 -Ithird_party/dr_libs -Ithird_party/stb src/app.c src/gfx.c src/player.c \
-  src/decoder.c src/tags.c src/library.c src/platform_host.c src/main_host.c \
+  src/decoder.c src/tags.c src/catalog.c src/platform_host.c src/main_host.c \
   src/stbiw_impl.c -o host_test -lm -lpthread
-HOST_ROOT=/path/to/music ./host_test x ./shots
+HOST_ROOT=/path/to/music ./host_test x ./shots   # HOST_FRESH=1 to rescan from scratch
 ```
 
 ## Code map
@@ -86,6 +92,6 @@ HOST_ROOT=/path/to/music ./host_test x ./shots
 - `player.c` — playback thread, queue, gapless chaining, dither, resampler
 - `decoder.c` — FLAC/WAV/MP3/OGG behind one interface
 - `tags.c` — Vorbis comments, ID3v2, embedded/folder cover art
-- `library.c` — folder listing, natural sort, recursive "play all"
-- `app.c` — UI (both screens), input, screen-off mode
+- `catalog.c` — music library: background scan, albums/artists, index and thumbnail caches
+- `app.c` — UI (library tabs, album/artist pages, now playing), input, screen-off mode
 - `gfx.c` — software renderer: anti-aliased shapes, images, text

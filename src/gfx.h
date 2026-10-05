@@ -39,9 +39,9 @@ void gfx_mask(canvas *c, const mask *m, int x, int y, uint32_t col);
 uint32_t col_mix(uint32_t a, uint32_t b, float t);
 
 // Text
-enum { FONT_REGULAR, FONT_SEMIBOLD, FONT_GEIST, FONT_GEIST_MEDIUM, FONT_COUNT };
+enum { FONT_GEIST, FONT_GEIST_MEDIUM, FONT_PIXEL, FONT_COUNT };
 // css_px: sizes for this face are em sizes, as in Figma/CSS (and the face is
-// kerned). Otherwise size is the ascent-to-descent height (the Inter UI).
+// kerned). Otherwise size is the ascent-to-descent height.
 int  font_load(int face, const char *path, int css_px);
 // Baseline offset from the top of a line box of height line_h. line_h <= 0
 // means the font's normal line height (Figma's "auto").

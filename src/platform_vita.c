@@ -261,6 +261,9 @@ int plat_list_dir(const char *path, plat_dirent **out) {
         strncpy(v[n].name, e.d_name, sizeof v[n].name - 1);
         v[n].name[sizeof v[n].name - 1] = 0;
         v[n].is_dir = SCE_S_ISDIR(e.d_stat.st_mode);
+        v[n].size = (uint64_t)e.d_stat.st_size;
+        const SceDateTime *t = &e.d_stat.st_mtime; // packed into one comparable number
+        v[n].mtime = ((((((uint64_t)t->year * 13 + t->month) * 32 + t->day) * 24 + t->hour) * 60 + t->minute) * 60 + t->second) * 1000000 + t->microsecond;
         n++;
     }
     sceIoDclose(d);
@@ -274,17 +277,8 @@ int plat_path_exists(const char *path) {
 }
 void plat_mkdir(const char *path) { sceIoMkdir(path, 0777); }
 const char *plat_data_dir(void) { return "ux0:data/Fidelity"; }
-const char *plat_root_dir(void) { return "ux0:"; }
+const char *plat_music_dir(void) { return "ux0:data/Fidelity/Music"; }
 
-int plat_devices(char names[][16], int max) {
-    static const char *cands[] = { "ux0:", "uma0:", "imc0:", "ur0:", "xmc0:", "grw0:" };
-    int n = 0;
-    for (unsigned i = 0; i < sizeof cands / sizeof *cands && n < max; i++) {
-        SceUID d = sceIoDopen(cands[i]);
-        if (d >= 0) { sceIoDclose(d); strcpy(names[n++], cands[i]); }
-    }
-    return n;
-}
 
 void plat_log(const char *fmt, ...) {
     char path[128];

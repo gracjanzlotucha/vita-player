@@ -62,13 +62,11 @@ void plat_audio_output(const int16_t *frames); // blocks; AUDIO_GRAIN frames
 void plat_audio_drain(void);
 
 // Filesystem
-typedef struct { char name[256]; int is_dir; } plat_dirent;
+typedef struct { char name[256]; int is_dir; uint64_t size, mtime; } plat_dirent;
 // Lists a directory. Returns count or -1. Caller frees *out.
 int  plat_list_dir(const char *path, plat_dirent **out);
 int  plat_path_exists(const char *path);
 void plat_mkdir(const char *path);
 const char *plat_data_dir(void);   // writable dir for settings
-const char *plat_root_dir(void);   // starting browse dir
+const char *plat_music_dir(void);  // the library: everything under it is scanned
 void plat_log(const char *fmt, ...); // appends to <data_dir>/log.txt
-// Root device list (e.g. ux0:, uma0:). Returns count, fills names.
-int  plat_devices(char names[][16], int max);

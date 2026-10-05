@@ -1,8 +1,9 @@
 // Scripted desktop run: drives the real app code with fake button presses
-// and saves screenshots. Usage: host_test <music_root> <out_dir>
+// and saves screenshots. Usage: HOST_ROOT=<music folder> host_test x <out_dir>
 #include "app.h"
 #include "platform.h"
 #include "player.h"
+#include "catalog.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,92 +40,96 @@ static void shot(const char *name) {
     printf("shot %s\n", p);
 }
 
+static void wait_scan(void) {
+    run_ms(100);
+    while (cat_scanning(NULL, NULL)) run_ms(50);
+    run_ms(300); // thumbnails
+}
+
 int main(int argc, char **argv) {
     snprintf(outdir, sizeof outdir, "%s", argc > 2 ? argv[2] : ".");
+    if (getenv("HOST_FRESH")) { // forget the cached index and thumbnails
+        char p[600];
+        snprintf(p, sizeof p, "rm -rf %s/library.idx %s/cache %s/settings.txt", plat_data_dir(), plat_data_dir(), plat_data_dir());
+        if (system(p)) {}
+    }
     if (app_init(getenv("ASSETS") ? getenv("ASSETS") : "assets") != 0) { fprintf(stderr, "init failed\n"); return 1; }
     const char *script = getenv("SCRIPT") ? getenv("SCRIPT") : "default";
-    run_ms(100);
     if (!strcmp(script, "default")) {
-        shot("01_browser_root");
-        tap(BTN_CROSS);            // open first folder (artist)
-        shot("02_browser_artist");
-        tap(BTN_CROSS);            // open album
+        run_ms(150);
+        shot("01_scanning_or_empty");
+        wait_scan();
+        shot("02_albums");
+        tap(BTN_R);
+        shot("03_tracks");
+        tap(BTN_R);
+        shot("04_artists");
+        tap(BTN_R);
+        shot("05_settings");
+        tap(BTN_R);                // back to Albums
         tap(BTN_DOWN);
-        shot("03_browser_album");
-        tap(BTN_CROSS);            // play 2nd track
-        run_ms(1500);
-        shot("04_now_playing");
-        tap(BTN_SQUARE);           // shuffle on
-        shot("05_shuffle_toast");
-        tap(BTN_SQUARE);
-        tap(BTN_CIRCLE);           // back to library
-        run_ms(500);
-        shot("06_browser_playing");
-        tap(BTN_R);                // next track
+        tap(BTN_CROSS);            // open the 2nd album
+        run_ms(400);
+        shot("06_album_page");
+        tap(BTN_DOWN);
+        tap(BTN_CROSS);            // play its 2nd track
         run_ms(800);
-        tap(BTN_TRIANGLE);
-        shot("07_next_track");
+        shot("07_now_playing");
+        tap(BTN_CIRCLE);           // back to the album page, mini player on
+        run_ms(200);
+        shot("08_album_page_playing");
+        tap(BTN_CIRCLE);
+        run_ms(200);
+        shot("09_albums_playing");
+        tap(BTN_L);                // to Settings (wraps), then Artists
+        tap(BTN_L);
+        tap(BTN_CROSS);
+        run_ms(300);
+        shot("10_artist_page");
+        tap(BTN_TRIANGLE);         // Now playing
         tap(BTN_SELECT);           // screen off
         tap(BTN_START);            // pause while off
         tap(BTN_SELECT);           // wake
-        shot("08_paused_after_wake");
+        shot("11_paused_after_wake");
     } else if (!strcmp(script, "touch")) {
-        shot("t01_root");
-        tap_at(300, 80 + 26);      // first row: open folder
-        tap_at(300, 80 + 26);      // open album
-        shot("t02_album");
-        drag(300, 400, 300, 250, 120, 0); // flick up
-        run_ms(100);
-        shot("t03_flinging");
+        wait_scan();
+        shot("t01_albums");
+        drag(400, 400, 400, 200, 120, 0); // flick up
         run_ms(1500);
-        shot("t04_after_fling");
-        touch(300, 80 + 52 * 3 + 26); // finger resting on a row
-        run_ms(100);
-        shot("t05a_row_pressed");
-        drag(300, 80 + 52 * 3 + 26, 300, 380, 400, 1); // ...becomes a slow drag down
-        shot("t05_dragging");
-        lift();
-        tap(BTN_DOWN);             // selection was scrolled away: comes back on screen
-        shot("t05b_dpad_after_scroll");
-        tap_at(300, 80 + 52 * 2 + 26); // play the third visible row
-        run_ms(800);
-        shot("t06_now_playing");
-        touch(698, 416);           // press play/pause: pressed highlight
-        shot("t07_pressed");
-        lift();                    // ...release pauses
-        shot("t08_paused");
-        tap_at(484, 416);          // shuffle
-        shot("t09_shuffle");
-        drag(475, 330, 698, 330, 300, 1); // scrub to the middle
-        shot("t10_scrubbing");
-        lift();
-        shot("t11_after_seek");
-        tap_at(786, 416);          // next
-        run_ms(300);
-        shot("t12_next");
-        tap_at(760, 526);          // "Library" hint
+        shot("t02_after_fling");
+        tap_at(100, 18);           // "Tracks" tab... (Albums is at x 36)
+        tap_at(122, 18);
         run_ms(200);
-        shot("t13_library_hint");
-        tap_at(896, 465);          // mini player play/pause
-        shot("t14_mini_toggle");
-        tap_at(300, 465);          // mini player card -> now playing
-        shot("t15_mini_open");
-        tap_at(880, 526);          // "Screen off" hint
-        tap_at(698, 416);          // ignored while the screen is off
-        tap(BTN_SELECT);           // wake
-        shot("t16_after_wake");
-
+        shot("t03_tracks_tab");
+        tap_at(400, 52 + 26);      // play the first track
+        run_ms(600);
+        shot("t04_now_playing");
+        touch(698, 430);           // press play/pause
+        shot("t05_pressed");
+        lift();
+        tap_at(484, 430);          // shuffle
+        shot("t06_shuffle");
+        drag(475, 346, 698, 346, 300, 1); // scrub
+        shot("t07_scrubbing");
+        lift();
+        tap_at(60, 526);           // "O Back"
+        run_ms(200);
+        shot("t08_back_with_mini");
+        tap_at(758, 460);          // mini play/pause
+        run_ms(100);
+        shot("t09_mini_paused");
+        tap_at(300, 460);          // mini card -> Now playing
+        run_ms(200);
+        shot("t10_np_from_mini");
     } else if (!strcmp(script, "np")) {
-        // Now playing states. HOST_ROOT = an album folder; plays its 3rd file.
-        shot("np01_nothing_playing_lib");
-        tap(BTN_TRIANGLE);
-        shot("np02_not_playing");
-        tap(BTN_CIRCLE);
+        // Now playing states. HOST_ROOT holds one album; plays its 3rd track.
+        wait_scan();
+        tap(BTN_CROSS);            // open the album
         tap(BTN_DOWN); tap(BTN_DOWN);
-        tap(BTN_CROSS);
+        tap(BTN_CROSS);            // play track 3
         run_ms(600);
         tap(BTN_CROSS);            // pause
-        tap_at(550, 330);          // seek to ~17%
+        tap_at(550, 346);          // seek to ~17%
         run_ms(300);
         shot("np03_paused");
         tap(BTN_CROSS);            // play
@@ -132,22 +137,18 @@ int main(int argc, char **argv) {
         tap(BTN_TRIANGLE); tap(BTN_TRIANGLE); // repeat one
         run_ms(200);
         shot("np04_playing_modes");
-        drag(560, 330, 760, 330, 300, 1);
-        shot("np05_scrubbing");
-        lift();
-        touch(698, 416);
-        shot("np06_pressed_play");
-        lift();
-        tap(BTN_SQUARE);           // shuffle off
-        host_buttons = BTN_R; app_step(BTN_R); host_buttons = 0; app_step(0); // rapid skips,
-        host_buttons = BTN_L; app_step(BTN_L); host_buttons = 0; app_step(0); // no waiting
-        host_buttons = BTN_L; app_step(BTN_L); host_buttons = 0; app_step(0);
+        tap(BTN_CIRCLE);
         run_ms(300);
-        shot("np07_after_rapid_skips"); // Track 2, same cover throughout
+        shot("np05_album_page_mini");
+        tap(BTN_CIRCLE);
+        run_ms(300);
+        shot("np06_albums_mini");
     } else if (!strcmp(script, "audio")) {
-        // play whole tree and let it run to the end, gapless check
+        // play the first album in order and let it run to the end (gapless check)
         host_realtime_audio = 0;
-        tap(BTN_SQUARE);
+        wait_scan();
+        tap(BTN_CROSS);            // open the first album
+        tap(BTN_CROSS);            // play from track 1
         player_status s;
         do { run_ms(200); player_get_status(&s); } while (s.has_track);
         printf("finished\n");

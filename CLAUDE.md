@@ -26,9 +26,9 @@ from the memory card. See README.md for controls and the user-facing feature lis
 - Whether the BGM port ever refuses to open (there is a MAIN-port 48 kHz fallback).
 
 ## Architecture
-- Threads: UI = main thread (core 0); audio thread (prio 0x50, core 1); two
-  low-priority workers on core 2 — the track info loader (`app.c`) and the MP3
-  seek indexer (`player.c`). `plat_cpu_boost()` raises the clock 333 → 444 MHz
+- Threads: UI = main thread (core 0); audio thread (prio 0x50, core 1); three
+  low-priority workers on core 2 — the track info loader (`app.c`), the MP3
+  seek indexer (`player.c`) and the library scanner/thumbnailer (`catalog.c`). `plat_cpu_boost()` raises the clock 333 → 444 MHz
   only while cover art is decoded.
 - `src/platform.h` is the only seam between app code and the console.
   `platform_vita.c` implements it with Vita APIs; `platform_host.c` is a desktop
@@ -41,7 +41,17 @@ from the memory card. See README.md for controls and the user-facing feature lis
   bit-exact >>16 (16-bit sources at a port-supported rate), TPDF dither (24-bit),
   or windowed-sinc resample + dither (88.2k/96k/192k). Next track is chained into
   the same output buffer, so same-rate tracks are gapless.
-- `app.c`: both screens (library, now playing), input, screen-off mode, settings.
+- `catalog.c`: the library is everything under `plat_music_dir()`
+  (`ux0:data/Fidelity/Music`; no file browser). Scanned in the background on
+  every start / Rescan; `library.idx` caches tags + format per file, keyed by
+  path, size and mtime, so only new/changed files are read. Albums group by
+  album + album artist (no album artist: album + folder, so compilations stay
+  together); artists are album artists. The UI takes published catalogs from
+  `cat_poll()`. Thumbnails (48/36 px) are made on demand, newest request first,
+  and cached as raw RGBA in `ux0:data/Fidelity/cache/<key>.t48`; `cat_cover()`
+  gives the 120 px album-page header.
+- `app.c`: library (tabs Albums/Tracks/Artists/Settings, album and artist
+  pages, mini player), now playing, input, screen-off mode, settings.
   Track changes never block the UI: `loader_thread` reads tags, decodes the
   cover once (400 px; 48 px is scaled from it) and builds the background; the UI
   collects results in `refresh_track()`. Art is keyed by a hash of the picture
@@ -60,16 +70,19 @@ from the memory card. See README.md for controls and the user-facing feature lis
 ## Design
 - Source of truth: Gracjan's Figma file `aneQdWK0xWY8aeacwMLOuV` (Figma
   connector). Frames are 960x544, so Figma coordinates map 1:1 to the screen.
-- Now playing (node `1:2`) is implemented. The library screen still has the old
-  placeholder look and is next.
-- Fonts loaded with `css_px=1` (Geist) take Figma/CSS em sizes and are kerned;
-  `np_text()` positions text by its Figma line-box top. Inter faces keep the old
-  sizing until the library is redesigned.
-- The Now playing background (blurred, saturated cover at 20%) is built once per
-  track by `build_bg()` on the loader thread and copied into `np_static`.
-- Not in the Figma frame, so designed to match: pause icon, active
-  shuffle/repeat pill, repeat-one badge, "Not Playing" state, the hint row in
-  the bottom panel, toast.
+- Implemented: Now Playing (node `1:2`) and Library / Albums tab with the mini
+  player (node `14:292`). Checked by overlaying renders on Figma exports.
+- Fonts: Geist Regular/Medium and Geist Pixel Square (bars, pills, hints),
+  all loaded with `css_px=1` (Figma/CSS em sizes, kerned); `text_at()`
+  positions text by its Figma line-box top. Geist Pixel has no □/△, so the
+  hint bar draws those keys as small shapes (`key_draw`).
+- Backgrounds (blurred, saturated cover at 25%) for Now Playing and the mini
+  player are built once per track by `build_bg()` on the loader thread.
+- Not in Figma, so designed to match (Gracjan may redesign): album page
+  (120 px header + numbered track list), artist page, Tracks / Artists /
+  Settings tabs, empty and scanning states, pause icons, active
+  shuffle/repeat pill, repeat-one badge, "Not Playing", toast, the extra
+  "△ Now Playing" hint in the library.
 
 ## Building
 Vita: VitaSDK at `$VITASDK`, then `mkdir build && cd build && cmake .. && make`
@@ -79,9 +92,9 @@ vita-elf-create otherwise failed with "segment 1 overlaps".
 Desktop test build (no console needed) — use it to check UI changes and audio:
 ```
 gcc -O2 -Ithird_party/dr_libs -Ithird_party/stb src/app.c src/gfx.c src/player.c \
-  src/decoder.c src/tags.c src/library.c src/platform_host.c src/main_host.c \
+  src/decoder.c src/tags.c src/catalog.c src/platform_host.c src/main_host.c \
   src/stbiw_impl.c -o host_test -lm -lpthread
-HOST_ROOT=/path/to/music ./host_test x ./shots            # scripted screenshots
+HOST_ROOT=/path/to/music ./host_test x ./shots            # scripted screenshots (HOST_FRESH=1: rescan)
 HOST_ROOT=/path/to/album HOST_WAV=out.wav SCRIPT=audio ./host_test x .  # render audio
 HOST_ROOT=/path/to/music SCRIPT=touch ./host_test x ./shots  # scripted touch gestures
 ```

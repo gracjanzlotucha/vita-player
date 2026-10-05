@@ -121,7 +121,10 @@ int plat_list_dir(const char *path, plat_dirent **out) {
         char full[1024];
         snprintf(full, sizeof full, "%s/%s", path, e->d_name);
         struct stat st;
-        v[n].is_dir = stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+        int ok = stat(full, &st) == 0;
+        v[n].is_dir = ok && S_ISDIR(st.st_mode);
+        v[n].size = ok ? (uint64_t)st.st_size : 0;
+        v[n].mtime = ok ? (uint64_t)st.st_mtime : 0;
         n++;
     }
     closedir(d);
@@ -131,8 +134,7 @@ int plat_list_dir(const char *path, plat_dirent **out) {
 int plat_path_exists(const char *p) { struct stat st; return stat(p, &st) == 0; }
 void plat_mkdir(const char *p) { mkdir(p, 0777); }
 const char *plat_data_dir(void) { const char *d = getenv("HOST_DATA"); return d ? d : "/tmp/fidelity-data"; }
-const char *plat_root_dir(void) { const char *r = getenv("HOST_ROOT"); return r ? r : "."; }
-int plat_devices(char names[][16], int max) { (void)max; strcpy(names[0], "ux0:"); strcpy(names[1], "uma0:"); return 2; }
+const char *plat_music_dir(void) { const char *r = getenv("HOST_ROOT"); return r ? r : "./music"; }
 void plat_log(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     fprintf(stderr, "[log] "); vfprintf(stderr, fmt, ap); fputc('\n', stderr);
