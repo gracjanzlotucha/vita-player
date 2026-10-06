@@ -30,6 +30,7 @@ add_executable(${PROJECT_NAME}
   src/decoder.c
   src/tags.c
   src/catalog.c
+  src/stbiw_impl.c
 )
 
 target_link_libraries(${PROJECT_NAME}

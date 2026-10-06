@@ -191,6 +191,144 @@ void gfx_blit(canvas *c, const image *img, int x, int y) {
     }
 }
 
+// Draws img scaled into the w x h rect at (x, y), corners rounded by r.
+// smooth: bilinear (still frames), else nearest (fast, for animation).
+// shade 0..255 darkens (255 = as is); alpha 0..255 fades the whole thing.
+void gfx_image_scaled(canvas *c, const image *img, int x, int y, int w, int h, float r, int shade, int alpha, int smooth) {
+    if (!img || !img->px || w <= 0 || h <= 0 || alpha <= 0) return;
+    static int sx0[2048], fx[2048];
+    if (w > 2048) return;
+    for (int i = 0; i < w; i++) {
+        float u = (i + 0.5f) * img->w / w - 0.5f;
+        if (u < 0) u = 0;
+        int iu = (int)u;
+        if (iu > img->w - 1) iu = img->w - 1;
+        sx0[i] = iu;
+        fx[i] = smooth && iu < img->w - 1 ? (int)((u - iu) * 256) : 0;
+    }
+    for (int j = 0; j < h; j++) {
+        int yy = y + j;
+        if (yy < c->cy0 || yy >= c->cy1) continue;
+        float v = (j + 0.5f) * img->h / h - 0.5f;
+        if (v < 0) v = 0;
+        int iv = (int)v;
+        if (iv > img->h - 1) iv = img->h - 1;
+        int fy = smooth && iv < img->h - 1 ? (int)((v - iv) * 256) : 0;
+        const uint32_t *r0 = img->px + iv * img->w, *r1 = fy ? r0 + img->w : r0;
+        int corner_row = r > 0 && (j < r + 1 || j > h - r - 2);
+        uint32_t *dst = c->px + yy * c->stride;
+        for (int i = 0; i < w; i++) {
+            int xx = x + i;
+            if (xx < c->cx0 || xx >= c->cx1) continue;
+            uint32_t p;
+            int k = sx0[i], f = fx[i];
+            if (!f && !fy) p = r0[k];
+            else {
+                uint32_t a = r0[k], b = f ? r0[k + 1] : a, cc = r1[k], d = f ? r1[k + 1] : cc;
+                p = 0xFF000000u;
+                for (int sh = 0; sh < 24; sh += 8) {
+                    int top = (int)((a >> sh) & 255) * (256 - f) + (int)((b >> sh) & 255) * f;
+                    int bot = (int)((cc >> sh) & 255) * (256 - f) + (int)((d >> sh) & 255) * f;
+                    p |= (uint32_t)(((top >> 8) * (256 - fy) + (bot >> 8) * fy) >> 8) << sh;
+                }
+            }
+            if (shade < 255)
+                p = ((p & 255) * shade / 255) | (((p >> 8) & 255) * shade / 255) << 8 | (((p >> 16) & 255) * shade / 255) << 16 | 0xFF000000u;
+            int cov = alpha;
+            if (corner_row && (i < r + 1 || i > w - r - 2)) cov = (int)(rbox_cov(i + 0.5f, j + 0.5f, 0, 0, w, h, r) * alpha);
+            blend(&dst[xx], p, cov);
+        }
+    }
+}
+
+// Blurred cover backgrounds, per the Figma "Background" layers: the cover
+// drawn into the rect (fx, fy, fw, fh) relative to the output, saturation
+// +29%, 128 px layer blur, a faint noise, at `opacity` over black. Now
+// playing: 960x544 with the cover at (-46,-253) 1051x1050; mini player:
+// 696x64 with a 1156 px cover centred. The blur runs on a 64x64 grid (the
+// cover is that soft anyway) with transparent padding, so the edges fade
+// out like a Figma layer blur does.
+int image_backdrop(const image *cov, image *out, int ow, int oh, float fx, float fy, float fw, float fh, float opacity) {
+    enum { G = 64, PAD = 14, N = G + 2 * PAD };
+    if (ow > 1024) return -1;
+    out->px = malloc((size_t)ow * oh * 4);
+    if (!out->px) return -1;
+    out->w = ow; out->h = oh;
+    float *g = calloc(N * N * 3, sizeof *g), *t = calloc(N * N * 3, sizeof *t);
+    if (!g || !t) { free(g); free(t); image_free(out); return -1; }
+    // area-average the cover into the grid (premultiplied: padding is 0)
+    for (int gy = 0; gy < G; gy++)
+        for (int gx = 0; gx < G; gx++) {
+            int x0 = gx * cov->w / G, x1 = (gx + 1) * cov->w / G, y0 = gy * cov->h / G, y1 = (gy + 1) * cov->h / G;
+            uint32_t r = 0, gg = 0, b = 0, n = 0;
+            for (int y = y0; y < y1; y++)
+                for (int x = x0; x < x1; x++, n++) {
+                    uint32_t p = cov->px[y * cov->w + x];
+                    r += p & 255; gg += (p >> 8) & 255; b += (p >> 16) & 255;
+                }
+            if (!n) continue;
+            float fr = (float)r / n, fg = (float)gg / n, fb = (float)b / n;
+            float l = 0.299f * fr + 0.587f * fg + 0.114f * fb; // saturation +29%
+            float *o = &g[((gy + PAD) * N + gx + PAD) * 3];
+            o[0] = l + (fr - l) * 1.29f; o[1] = l + (fg - l) * 1.29f; o[2] = l + (fb - l) * 1.29f;
+            for (int k = 0; k < 3; k++) o[k] = o[k] < 0 ? 0 : o[k] > 255 ? 255 : o[k];
+        }
+    // separable gaussian; Figma's blur radius is about two sigmas
+    float sigma = 64.0f / (fw / G), kw[2 * PAD + 1], ksum = 0;
+    for (int i = -PAD; i <= PAD; i++) ksum += kw[i + PAD] = expf(-(float)(i * i) / (2 * sigma * sigma));
+    for (int i = 0; i <= 2 * PAD; i++) kw[i] /= ksum;
+    for (int pass = 0; pass < 2; pass++) {
+        float *src = pass ? t : g, *dst = pass ? g : t;
+        int step = pass ? N * 3 : 3;
+        for (int y = 0; y < N; y++)
+            for (int x = 0; x < N; x++) {
+                int c0 = pass ? y : x, lo = c0 - PAD < 0 ? -c0 : -PAD, hi = c0 + PAD >= N ? N - 1 - c0 : PAD;
+                const float *p = &src[(y * N + x) * 3];
+                float a0 = 0, a1 = 0, a2 = 0;
+                for (int k = lo; k <= hi; k++) {
+                    const float *q = p + k * step;
+                    float w = kw[k + PAD];
+                    a0 += q[0] * w; a1 += q[1] * w; a2 += q[2] * w;
+                }
+                float *o = &dst[(y * N + x) * 3];
+                o[0] = a0; o[1] = a1; o[2] = a2;
+            }
+    }
+    // upscale bilinearly: interpolate each screen row once across the grid,
+    // then along it. The noise also breaks up banding in a gradient this dark.
+    int col_ix[1024];    // per call: this runs on more than one thread
+    float col_t[1024];
+    for (int x = 0; x < ow; x++) {
+        float u = (x - fx) / fw * G + PAD - 0.5f;
+        col_ix[x] = (int)floorf(u);
+        col_t[x] = u - col_ix[x];
+    }
+    float row[N * 3];
+    uint32_t seed = 0x9E3779B9u;
+    for (int y = 0; y < oh; y++) {
+        float v = (y - fy) / fh * G + PAD - 0.5f;
+        int iy = (int)floorf(v);
+        float ty = v - iy;
+        const float *r0 = &g[iy * N * 3], *r1 = r0 + N * 3;
+        for (int i = 0; i < N * 3; i++) row[i] = (r0[i] + (r1[i] - r0[i]) * ty) * opacity;
+        uint32_t *o = &out->px[y * ow];
+        for (int x = 0; x < ow; x++) {
+            const float *a = &row[col_ix[x] * 3];
+            float tx = col_t[x];
+            seed = seed * 1664525u + 1013904223u;
+            float grain = 0.95f + (seed >> 24) * (0.05f / 255.0f), dith = ((seed >> 8) & 255) * (1.0f / 255.0f);
+            uint32_t px = 0xFF000000u;
+            for (int c = 0; c < 3; c++) {
+                int q = (int)((a[c] + (a[c + 3] - a[c]) * tx) * grain + dith);
+                px |= (uint32_t)(q > 255 ? 255 : q) << (c * 8);
+            }
+            o[x] = px;
+        }
+    }
+    free(g); free(t);
+    return 0;
+}
+
 // ---------------- path masks ----------------
 typedef struct { float x0, y0, x1, y1; } pedge;
 typedef struct { pedge *e; int n, cap; float cx, cy, sx, sy; float scale; } pbuild;
@@ -446,6 +584,12 @@ float font_baseline(int face, float size, float line_h) {
     float sc = face_scale(face, size);
     if (line_h <= 0) line_h = (a - d + l) * sc;
     return (line_h - (a - d) * sc) / 2 + a * sc;
+}
+
+float font_line_height(int face, float size) {
+    int a, d, l;
+    stbtt_GetFontVMetrics(&fonts[face], &a, &d, &l);
+    return (a - d + l) * face_scale(face, size);
 }
 
 // kerning between two glyphs (css faces only)

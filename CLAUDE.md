@@ -52,7 +52,10 @@ from the memory card. See README.md for controls and the user-facing feature lis
   together); artists are album artists. The UI takes published catalogs from
   `cat_poll()`. Thumbnails (48/36 px) are made on demand, newest request first,
   and cached as raw RGBA in `ux0:data/Fidelity/cache/<key>.t48`; `cat_cover()`
-  gives the 120 px album-page header.
+  gives the 120 px album-page header. Cover Flow uses `cat_art()` (340 px,
+  16-slot LRU owned by the UI thread, cached as `<key>.a340.jpg`) and
+  `cat_backdrop()` (full-screen blurred backdrop, one at a time; keeps
+  returning the previous one until the new one is built).
 - `app.c`: library (tabs Albums/Tracks/Artists/Settings, album and artist
   pages, mini player), now playing, input, screen-off mode, settings.
   Track changes never block the UI: `loader_thread` reads tags, decodes the
@@ -65,6 +68,11 @@ from the memory card. See README.md for controls and the user-facing feature lis
   becomes a one-tick virtual button press, so touch reuses the button handlers.
   Exceptions are list drag/fling scrolling (`list_y`, pixels) and progress-bar
   scrubbing (`player_seek_to` on release).
+  Cover Flow (`album_view`): `cf_pos` (float, in albums) eases towards the
+  selection in `cf_step()`; covers are placed by interpolating the Figma
+  keyframes `CFK`. While moving it draws nearest-neighbour without shadows;
+  once still it composes one smooth frame into `cf_still` (keyed by the
+  selection and the image pixel pointers) and just copies it.
 - `gfx.c`: software renderer (anti-aliased SDF shapes, images, stb_truetype text)
   into a RAM buffer that is copied to a CDRAM framebuffer on present. Also
   rasterises SVG path data into coverage masks (`mask_from_path`), used for
@@ -73,19 +81,24 @@ from the memory card. See README.md for controls and the user-facing feature lis
 ## Design
 - Source of truth: Gracjan's Figma file `aneQdWK0xWY8aeacwMLOuV` (Figma
   connector). Frames are 960x544, so Figma coordinates map 1:1 to the screen.
-- Implemented: Now Playing (node `1:2`) and Library / Albums tab with the mini
-  player (node `14:292`). Checked by overlaying renders on Figma exports.
+- Implemented: Now Playing (node `1:2`), Library / Albums tab with the mini
+  player (node `14:292`) and the Cover Flow album view (node `42:231`). Checked by overlaying renders on Figma exports.
 - Fonts: Geist Regular/Medium and Geist Pixel Square (bars, pills, hints),
   all loaded with `css_px=1` (Figma/CSS em sizes, kerned); `text_at()`
   positions text by its Figma line-box top. Geist Pixel has no □/△, so the
   hint bar draws those keys as small shapes (`key_draw`).
 - Backgrounds (blurred, saturated cover at 25%) for Now Playing and the mini
-  player are built once per track by `build_bg()` on the loader thread.
+  player are built once per track by `image_backdrop()` (gfx.c) on the loader
+  thread.
 - Not in Figma, so designed to match (Gracjan may redesign): album page
   (120 px header + numbered track list), artist page, Tracks / Artists /
   Settings tabs, empty and scanning states, pause icons, active
   shuffle/repeat pill, repeat-one badge, "Not Playing", toast, the extra
-  "△ Now Playing" hint in the library.
+  "△ Now Playing" hint in the library, the Album View setting and □ hint,
+  Cover Flow title/pills moving to the artist line for long titles, covers
+  beyond the second neighbour (shrink and fade out).
+- Test library: `tools/make_test_albums.py <dir>` makes 12 placeholder albums
+  (generated covers, quiet tones, tags). Host check: `SCRIPT=covers`.
 
 ## Building
 Vita: VitaSDK at `$VITASDK`, then `mkdir build && cd build && cmake .. && make`

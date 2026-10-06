@@ -27,6 +27,12 @@ void gfx_triangle(canvas *c, float x0, float y0, float x1, float y1, float x2, f
 void gfx_triangle_outline(canvas *c, float x0, float y0, float x1, float y1, float x2, float y2, float thick, uint32_t col);
 void gfx_image(canvas *c, const image *img, int x, int y, float radius, uint8_t alpha);
 void gfx_blit(canvas *c, const image *img, int x, int y); // opaque copy, no blending
+void gfx_image_scaled(canvas *c, const image *img, int x, int y, int w, int h, float r, int shade, int alpha, int smooth);
+// Blurred cover background (Figma "Background" layer): the cover in the rect
+// (fx, fy, fw, fh) of a new ow x oh image, saturated, blurred, at `opacity`
+// over black. Returns 0 on success.
+int  image_backdrop(const image *cov, image *out, int ow, int oh, float fx, float fy, float fw, float fh, float opacity);
+float font_line_height(int face, float size); // "normal" (Figma auto)
 
 // 8-bit coverage mask, e.g. an icon rasterised from SVG path data.
 typedef struct { int w, h; uint8_t *a; } mask;

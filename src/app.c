@@ -86,15 +86,24 @@ static struct {
     float view_bottom;      // rows above this count as visible
 } L;
 
-static int mini_visible(const player_status *s) { return s->has_track && view != V_PLAYING; }
+// Albums tab layout: list or Cover Flow (Figma "Albums" 42:231), saved.
+static int album_view;          // 0 list, 1 cover flow
+static float cf_pos;            // animated position, in albums
+static uint64_t cf_last;        // last animation step
+static float cf_drag_from, cf_vel;
+
+static int coverflow(void) { return view == V_LIBRARY && tab == TAB_ALBUMS && album_view && cat && cat->nalbums; }
+
+// Cover Flow has no room for the mini player (its details sit there).
+static int mini_visible(const player_status *s) { return s->has_track && view != V_PLAYING && !coverflow(); }
 
 static void list_geom(const player_status *s) {
     memset(&L, 0, sizeof L);
     int ntr = cat ? cat->ntracks : 0, nal = cat ? cat->nalbums : 0, nar = cat ? cat->nartists : 0;
     L.top = 52; L.row = 52; L.bottom = 508;
-    if (view == V_LIBRARY) {
+    if (view == V_LIBRARY && !coverflow()) {
         L.l = &lst_tab[tab];
-        L.n = tab == TAB_ALBUMS ? nal : tab == TAB_TRACKS ? ntr : tab == TAB_ARTISTS ? nar : 3;
+        L.n = tab == TAB_ALBUMS ? nal : tab == TAB_TRACKS ? ntr : tab == TAB_ARTISTS ? nar : 4;
     } else if (view == V_ALBUM && cat && page_album >= 0) {
         L.l = &lst_album; L.n = cat->albums[page_album].ntracks;
         L.top = 188; L.row = 44;
@@ -149,7 +158,7 @@ static int reveal_selection(void) {
 // Every tap ends up as a (virtual) button press for one tick, so touch and
 // buttons share the same code paths. Draw code registers what is tappable
 // as it draws, so hit areas always match what is on screen.
-enum { Z_BUTTON, Z_LIST, Z_SEEK };
+enum { Z_BUTTON, Z_LIST, Z_SEEK, Z_COVERS };
 typedef struct { float x, y, w, h; int kind; uint32_t btn; } zone;
 static zone zones[48];
 static int nzones;
@@ -198,7 +207,7 @@ static void save_settings(void) {
     player_get_status(&s);
     FILE *f = fopen(settings_path, "w");
     if (!f) return;
-    fprintf(f, "tab=%d\nshuffle=%d\nrepeat=%d\n", tab, s.shuffle, s.repeat);
+    fprintf(f, "tab=%d\nshuffle=%d\nrepeat=%d\nalbumview=%d\n", tab, s.shuffle, s.repeat, album_view);
     fclose(f);
 }
 
@@ -210,6 +219,7 @@ static void load_settings(int *sh, int *rep) {
         if (!strncmp(line, "tab=", 4)) { int t = atoi(line + 4); if (t >= 0 && t < NTABS) tab = t; }
         else if (!strncmp(line, "shuffle=", 8)) *sh = atoi(line + 8);
         else if (!strncmp(line, "repeat=", 7)) *rep = atoi(line + 7);
+        else if (!strncmp(line, "albumview=", 10)) album_view = atoi(line + 10) ? 1 : 0;
     }
     fclose(f);
 }
@@ -379,93 +389,6 @@ static void find_current_track(const player_status *s) {
 // the art follows when decoded. Art is identified by a hash of the picture
 // bytes, so tracks sharing a cover (an album) reuse it without decoding.
 
-// Blurred cover backgrounds, per the Figma "Background" layers: the cover
-// drawn into the rect (fx, fy, fw, fh) relative to the output, saturation
-// +29%, 128 px layer blur, a faint noise, at `opacity` over black. Now
-// playing: 960x544 with the cover at (-46,-253) 1051x1050; mini player:
-// 696x64 with a 1156 px cover centred. The blur runs on a 64x64 grid (the
-// cover is that soft anyway) with transparent padding, so the edges fade
-// out like a Figma layer blur does.
-static int build_bg(const image *cov, image *out, int ow, int oh, float fx, float fy, float fw, float fh, float opacity) {
-    enum { G = 64, PAD = 14, N = G + 2 * PAD };
-    out->px = malloc((size_t)ow * oh * 4);
-    if (!out->px) return -1;
-    out->w = ow; out->h = oh;
-    float *g = calloc(N * N * 3, sizeof *g), *t = calloc(N * N * 3, sizeof *t);
-    if (!g || !t) { free(g); free(t); image_free(out); return -1; }
-    // area-average the cover into the grid (premultiplied: padding is 0)
-    for (int gy = 0; gy < G; gy++)
-        for (int gx = 0; gx < G; gx++) {
-            int x0 = gx * cov->w / G, x1 = (gx + 1) * cov->w / G, y0 = gy * cov->h / G, y1 = (gy + 1) * cov->h / G;
-            uint32_t r = 0, gg = 0, b = 0, n = 0;
-            for (int y = y0; y < y1; y++)
-                for (int x = x0; x < x1; x++, n++) {
-                    uint32_t p = cov->px[y * cov->w + x];
-                    r += p & 255; gg += (p >> 8) & 255; b += (p >> 16) & 255;
-                }
-            if (!n) continue;
-            float fr = (float)r / n, fg = (float)gg / n, fb = (float)b / n;
-            float l = 0.299f * fr + 0.587f * fg + 0.114f * fb; // saturation +29%
-            float *o = &g[((gy + PAD) * N + gx + PAD) * 3];
-            o[0] = l + (fr - l) * 1.29f; o[1] = l + (fg - l) * 1.29f; o[2] = l + (fb - l) * 1.29f;
-            for (int k = 0; k < 3; k++) o[k] = o[k] < 0 ? 0 : o[k] > 255 ? 255 : o[k];
-        }
-    // separable gaussian; Figma's blur radius is about two sigmas
-    float sigma = 64.0f / (fw / G), kw[2 * PAD + 1], ksum = 0;
-    for (int i = -PAD; i <= PAD; i++) ksum += kw[i + PAD] = expf(-(float)(i * i) / (2 * sigma * sigma));
-    for (int i = 0; i <= 2 * PAD; i++) kw[i] /= ksum;
-    for (int pass = 0; pass < 2; pass++) {
-        float *src = pass ? t : g, *dst = pass ? g : t;
-        int step = pass ? N * 3 : 3;
-        for (int y = 0; y < N; y++)
-            for (int x = 0; x < N; x++) {
-                int c0 = pass ? y : x, lo = c0 - PAD < 0 ? -c0 : -PAD, hi = c0 + PAD >= N ? N - 1 - c0 : PAD;
-                const float *p = &src[(y * N + x) * 3];
-                float a0 = 0, a1 = 0, a2 = 0;
-                for (int k = lo; k <= hi; k++) {
-                    const float *q = p + k * step;
-                    float w = kw[k + PAD];
-                    a0 += q[0] * w; a1 += q[1] * w; a2 += q[2] * w;
-                }
-                float *o = &dst[(y * N + x) * 3];
-                o[0] = a0; o[1] = a1; o[2] = a2;
-            }
-    }
-    // upscale bilinearly: interpolate each screen row once across the grid,
-    // then along it. The noise also breaks up banding in a gradient this dark.
-    static int col_ix[SCREEN_W];
-    static float col_t[SCREEN_W];
-    for (int x = 0; x < ow; x++) {
-        float u = (x - fx) / fw * G + PAD - 0.5f;
-        col_ix[x] = (int)floorf(u);
-        col_t[x] = u - col_ix[x];
-    }
-    float row[N * 3];
-    uint32_t seed = 0x9E3779B9u;
-    for (int y = 0; y < oh; y++) {
-        float v = (y - fy) / fh * G + PAD - 0.5f;
-        int iy = (int)floorf(v);
-        float ty = v - iy;
-        const float *r0 = &g[iy * N * 3], *r1 = r0 + N * 3;
-        for (int i = 0; i < N * 3; i++) row[i] = (r0[i] + (r1[i] - r0[i]) * ty) * opacity;
-        uint32_t *o = &out->px[y * ow];
-        for (int x = 0; x < ow; x++) {
-            const float *a = &row[col_ix[x] * 3];
-            float tx = col_t[x];
-            seed = seed * 1664525u + 1013904223u;
-            float grain = 0.95f + (seed >> 24) * (0.05f / 255.0f), dith = ((seed >> 8) & 255) * (1.0f / 255.0f);
-            uint32_t px = 0xFF000000u;
-            for (int c = 0; c < 3; c++) {
-                int q = (int)((a[c] + (a[c + 3] - a[c]) * tx) * grain + dith);
-                px |= (uint32_t)(q > 255 ? 255 : q) << (c * 8);
-            }
-            o[x] = px;
-        }
-    }
-    free(g); free(t);
-    return 0;
-}
-
 static uint32_t art_hash(const uint8_t *p, size_t n) {
     uint32_t h = 2166136261u ^ (uint32_t)n;
     size_t step = n > 65536 ? n / 65536 : 1; // sample big pictures
@@ -513,8 +436,8 @@ static int loader_thread(void *arg) {
             plat_cpu_boost(1);
             if (image_from_cover(cover, cover_n, 400, &big) == 0) {
                 image_scale(&big, 48, &small);
-                build_bg(&big, &bg, SCREEN_W, SCREEN_H, -46, -253, 1051, 1050, 0.25f);
-                build_bg(&big, &mini, MINI_W, MINI_H, -229, -546, 1156, 1156, 0.25f);
+                image_backdrop(&big, &bg, SCREEN_W, SCREEN_H, -46, -253, 1051, 1050, 0.25f);
+                image_backdrop(&big, &mini, MINI_W, MINI_H, -229, -546, 1156, 1156, 0.25f);
             }
             plat_cpu_boost(0);
             plat_mutex_lock(ld_m);
@@ -651,6 +574,9 @@ static void settings_row(int i, float y, int hl) {
         const char *p[1] = { a };
         draw_row(y, hl, 0, NULL, 0, "Rescan Library", "Look for new and changed music", p, 1, 0);
     } else if (i == 1) {
+        const char *p[1] = { album_view ? "Cover Flow" : "List" };
+        draw_row(y, hl, 0, NULL, 0, "Album View", "How the Albums tab shows your albums", p, 1, 0);
+    } else if (i == 2) {
         songs_text(a, sizeof a, cat ? cat->ntracks : 0);
         snprintf(b, sizeof b, "%d %s", cat ? cat->nalbums : 0, cat && cat->nalbums == 1 ? "Album" : "Albums");
         const char *p[2] = { b, a };
@@ -783,10 +709,132 @@ static void draw_mini(const player_status *s) {
     gfx_mask(&cv, &ic_next20, 792, 450, RGBA(255, 255, 255, 179));
 }
 
+// ---------------------------------------------------------------- cover flow
+// Figma "Albums" (42:231): the centred cover 337 px at (312, 72), its
+// neighbours 304 x 303 at y 89 and 251 at y 115, 169 / 318.5 px off centre,
+// dimmed to 50% over black, r12, a soft shadow; the album's blurred cover
+// behind at 25%; title / artist / pills under the centre cover. Positions in
+// between are interpolated, so flicking animates; beyond the second
+// neighbour covers shrink and fade out.
+typedef struct { float off, w, h, top, shade; } cf_key;
+static const cf_key CFK[4] = {
+    { 0, 337, 337, 72, 255 }, { 169, 304, 303, 89, 128 }, { 318.5f, 251, 251, 115, 128 }, { 430, 200, 200, 140, 128 },
+};
+static image cf_still;          // the composed view while nothing moves
+static uint32_t cf_still_sig;
+static const image *cf_bd;      // backdrop being shown
+
+static void cf_slot(float d, int *x, int *y, int *w, int *h, int *shade, int *alpha) {
+    float a = fabsf(d);
+    if (a > 3) a = 3;
+    int i = a >= 3 ? 2 : (int)a;
+    float t = a - i;
+    const cf_key *k0 = &CFK[i], *k1 = &CFK[i + 1];
+    float off = k0->off + (k1->off - k0->off) * t, fw = k0->w + (k1->w - k0->w) * t, fh = k0->h + (k1->h - k0->h) * t;
+    float cx = 480.5f + (d < 0 ? -off : off);
+    *w = (int)lroundf(fw); *h = (int)lroundf(fh);
+    *x = (int)lroundf(cx - fw / 2);
+    *y = (int)lroundf(k0->top + (k1->top - k0->top) * t);
+    *shade = (int)lroundf(k0->shade + (k1->shade - k0->shade) * t);
+    *alpha = a <= 2 ? 255 : (int)(255 * (3 - a));
+}
+
+// covers + details; smooth = bilinear and shadows (still frames)
+static void draw_covers(int smooth) {
+    int n = cat->nalbums;
+    int c0 = (int)floorf(cf_pos);
+    int idx[10], cnt = 0;
+    for (int i = c0 - 3; i <= c0 + 4; i++) if (i >= 0 && i < n && fabsf(i - cf_pos) < 3) idx[cnt++] = i;
+    // farthest first, so nearer covers overlap them
+    for (int a = 0; a < cnt; a++)
+        for (int b = a + 1; b < cnt; b++)
+            if (fabsf(idx[b] - cf_pos) > fabsf(idx[a] - cf_pos)) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+    for (int k = 0; k < cnt; k++) {
+        int i = idx[k], x, y, w, h, shade, alpha;
+        cf_slot(i - cf_pos, &x, &y, &w, &h, &shade, &alpha);
+        if (smooth) // drop shadow (12, 4), blur 25, 25% black
+            for (int r = 5; r >= 1; r--) gfx_rrect(&cv, x + 12 - r * 4, y + 4 - r * 4, w + r * 8, h + r * 8, 12 + r * 4, RGBA(0, 0, 0, alpha * 12 / 255));
+        const image *img = cat_art(cat, i);
+        if (!img) img = cat_thumb(cat, i, 48); // until the big one arrives
+        if (img) gfx_image_scaled(&cv, img, x, y, w, h, 12, shade, alpha, smooth);
+        else gfx_rrect(&cv, x, y, w, h, 12, WITH_ALPHA(col_mix(RGB(0, 0, 0), C_PLACEH, shade / 255.0f), alpha));
+    }
+    // details of the album in (or heading to) the centre
+    int sel = lst_tab[TAB_ALBUMS].sel;
+    const cat_album *al = &cat->albums[sel];
+    const cat_track *t = &cat->tracks[al->tracks[0]];
+    char q[40];
+    fmt_quality(q, sizeof q, t->fmt, t->bits, t->rate);
+    const char *p[2] = { format_label(t->fmt), q };
+    // pills beside the title as in Figma; a title too long for that moves
+    // them down to the artist line
+    float pw = pill_w(p[0]) + 8 + pill_w(p[1]);
+    int low = text_width(FONT_GEIST_MEDIUM, 24, al->title) > 644 - 12 - pw - 312;
+    float pl = pills_right(644, low ? 467 : 435, p, 2);
+    text_at(FONT_GEIST_MEDIUM, 24, 0, 312, 429, al->title, C_TEXT, low ? 644 - 312 : (int)(pl - 12 - 312));
+    text_at(FONT_GEIST, 16, 0, 312, 467, al->artist, C_TEXT2, (int)(low ? pl - 12 - 312 : 644 - 312));
+}
+
+static int cf_moving(void) {
+    return (tc.down && tc.z.kind == Z_COVERS && tc.moved) || fabsf(cf_pos - lst_tab[TAB_ALBUMS].sel) > 0.001f;
+}
+
+static void draw_coverflow(void) {
+    int sel = lst_tab[TAB_ALBUMS].sel;
+    if (!cf_moving()) cf_bd = cat_backdrop(cat, sel); // only once it has settled
+    if (cf_moving()) {
+        if (cf_bd) gfx_blit(&cv, cf_bd, 0, 0); else gfx_clear(&cv, RGB(0, 0, 0));
+        draw_covers(0);
+    } else {
+        // still: compose once (smooth + shadows), then just copy it
+        uint32_t sig = 2166136261u ^ (uint32_t)sel;
+        // pixel pointers, not image ones: the catalog reuses its image structs
+        sig = (sig ^ (uint32_t)(uintptr_t)(cf_bd ? cf_bd->px : NULL)) * 16777619u;
+        for (int i = sel - 2; i <= sel + 2; i++) {
+            if (i < 0 || i >= cat->nalbums) continue;
+            const image *a = cat_art(cat, i);
+            if (!a) a = cat_thumb(cat, i, 48);
+            sig = (sig ^ (uint32_t)(uintptr_t)(a ? a->px : NULL)) * 16777619u;
+        }
+        if (!cf_still.px && (cf_still.px = malloc(SCREEN_W * SCREEN_H * 4))) { cf_still.w = SCREEN_W; cf_still.h = SCREEN_H; cf_still_sig = 0; }
+        if (cf_still.px && sig != cf_still_sig) {
+            canvas screen = cv;
+            gfx_begin(&cv, cf_still.px, SCREEN_W, SCREEN_H, SCREEN_W);
+            if (cf_bd) gfx_blit(&cv, cf_bd, 0, 0); else gfx_clear(&cv, RGB(0, 0, 0));
+            draw_covers(1);
+            cv = screen;
+            cf_still_sig = sig;
+        }
+        if (cf_still.px) gfx_blit(&cv, &cf_still, 0, 0);
+    }
+    hot(0, 52, SCREEN_W, 400, -1, Z_COVERS, 0);
+    gfx_rect(&cv, 0, 0, SCREEN_W, 35, RGB(0, 0, 0)); // the top bar is black here
+}
+
+// one animation tick: ease the position towards the selection
+static void cf_step(void) {
+    uint64_t now = plat_time_us();
+    float dt = cf_last ? (now - cf_last) / 1e6f : 0;
+    cf_last = now;
+    if (!coverflow() || (tc.down && tc.z.kind == Z_COVERS)) return;
+    int n = cat->nalbums;
+    list_t *l = &lst_tab[TAB_ALBUMS];
+    if (l->sel >= n) l->sel = n - 1;
+    if (l->sel < 0) l->sel = 0;
+    float target = (float)l->sel, d = target - cf_pos;
+    if (fabsf(d) > 6) cf_pos = target - (d > 0 ? 6 : -6); // long jumps: skip ahead
+    if (dt > 0.1f) dt = 0.1f;
+    cf_pos += (target - cf_pos) * (1 - expf(-dt * 11));
+    if (fabsf(target - cf_pos) < 0.002f) cf_pos = target;
+    else dirty = 1;
+}
+
 static void draw_library(const player_status *s) {
     gfx_clear(&cv, RGB(0, 0, 0));
     int empty = !cat || !cat->ntracks;
-    if (view == V_LIBRARY) {
+    if (coverflow()) {
+        draw_coverflow();
+    } else if (view == V_LIBRARY) {
         if (tab == TAB_SETTINGS) draw_list(settings_row);
         else if (empty) draw_empty();
         else draw_list(tab == TAB_ALBUMS ? album_row : tab == TAB_TRACKS ? track_row : artist_row);
@@ -804,8 +852,9 @@ static void draw_library(const player_status *s) {
     hint scr = { "SELECT", "Screen Off", BTN_SELECT };
     if (view == V_LIBRARY) {
         hint left = { "X", tab == TAB_TRACKS ? "Play" : "Select", BTN_CROSS };
-        hint r[3]; int n = 0;
+        hint r[4]; int n = 0;
         if (s->has_track) r[n++] = nowp;
+        if (tab == TAB_ALBUMS && !empty) r[n++] = (hint){ "SQ", album_view ? "List View" : "Cover Flow", BTN_SQUARE };
         r[n++] = tabs; r[n++] = scr;
         draw_bottom(empty && tab != TAB_SETTINGS ? NULL : &left, r, n, 1);
     } else if (view == V_ALBUM) {
@@ -1041,6 +1090,7 @@ static uint32_t handle_touch(const player_status *s) {
         tc.caught = l && fabsf(l->vel) > 60; // finger stops a fling; that's not a tap
         if (l) l->vel = 0;
         if (z->kind == Z_SEEK) scrub = seek_frac(x);
+        if (z->kind == Z_COVERS) { cf_drag_from = cf_pos; cf_vel = 0; }
         dirty = 1;
     } else if (down) {
         float dy = y - tc.y;
@@ -1053,6 +1103,14 @@ static uint32_t handle_touch(const player_status *s) {
             tc.t_move = now;
         }
         if (tc.z.kind == Z_SEEK) scrub = seek_frac(x);
+        if (tc.z.kind == Z_COVERS && tc.moved && cat) {
+            float dt = (now - tc.t_move) / 1e6f, before = cf_pos;
+            cf_pos = cf_drag_from - (x - tc.x0) / 169.0f; // one neighbour step per 169 px
+            if (cf_pos < -0.4f) cf_pos = -0.4f;
+            if (cf_pos > cat->nalbums - 0.6f) cf_pos = cat->nalbums - 0.6f;
+            if (dt > 0) cf_vel = cf_vel * 0.6f + (cf_pos - before) / dt * 0.4f;
+            tc.t_move = now;
+        }
         if (x != tc.x || y != tc.y) dirty = 1;
         tc.x = x; tc.y = y;
     } else if (tc.down) {
@@ -1076,6 +1134,20 @@ static uint32_t handle_touch(const player_status *s) {
         case Z_BUTTON:
             if (in_zone(&tc.z, tc.x, tc.y)) out = tc.z.btn;
             break;
+        case Z_COVERS: {
+            if (!cat || !cat->nalbums) break;
+            list_t *al = &lst_tab[TAB_ALBUMS];
+            int target;
+            if (tc.moved) { // fling: carry on a little, land on a cover
+                float v = now - tc.t_move < 80000 ? cf_vel : 0;
+                target = (int)lroundf(cf_pos + v * 0.25f);
+            } else if (tc.x >= 312 && tc.x < 649) { out = BTN_CROSS; break; } // the centre cover opens it
+            else target = al->sel + (tc.x < 312 ? (tc.x < 159 ? -2 : -1) : (tc.x >= 801 ? 2 : 1));
+            if (target < 0) target = 0;
+            if (target > cat->nalbums - 1) target = cat->nalbums - 1;
+            al->sel = target;
+            break;
+        }
         }
     }
 
@@ -1129,6 +1201,7 @@ static void activate(int i) {
     if (view == V_LIBRARY) {
         if (tab == TAB_SETTINGS) {
             if (i == 0) { cat_rescan(); show_toast("Rescanning library"); }
+            if (i == 1) { album_view = !album_view; save_settings(); show_toast(album_view ? "Albums: Cover Flow" : "Albums: List"); }
             return;
         }
         if (!cat || i < 0) return;
@@ -1202,6 +1275,22 @@ static void handle_input(uint32_t b, player_status *s) {
         if (view == V_ALBUM) view = album_from_artist ? V_ARTIST : V_LIBRARY;
         else if (view == V_ARTIST) view = V_LIBRARY;
         dirty = 1;
+        return;
+    }
+    if (pressed(BTN_SQUARE, b, 0) && view == V_LIBRARY && tab == TAB_ALBUMS && cat && cat->nalbums) {
+        album_view = !album_view;
+        cf_pos = (float)lst_tab[TAB_ALBUMS].sel;
+        save_settings();
+        dirty = 1;
+        return;
+    }
+    if (coverflow()) {
+        list_t *al = &lst_tab[TAB_ALBUMS];
+        int left = pressed(BTN_LEFT, b, 1) || pressed(BTN_UP, b, 1);
+        int right = pressed(BTN_RIGHT, b, 1) || pressed(BTN_DOWN, b, 1);
+        if (left && al->sel > 0) { al->sel--; dirty = 1; }
+        if (right && al->sel < cat->nalbums - 1) { al->sel++; dirty = 1; }
+        if (pressed(BTN_CROSS, b, 0)) { activate(al->sel); dirty = 1; }
         return;
     }
     if (pressed(BTN_SQUARE, b, 0) && view == V_ALBUM) {
@@ -1335,6 +1424,7 @@ int app_step(uint32_t b) {
 
     handle_input(b, &s);
     prev_buttons = b;
+    cf_step();
     player_get_status(&s);
     refresh_track(&s);
     list_geom(&s);

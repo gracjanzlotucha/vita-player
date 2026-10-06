@@ -1,5 +1,9 @@
 #include "catalog.h"
 #include "platform.h"
+#include "gfx.h"
+#define STBI_NO_STDIO // as built in tags.c
+#include "stb_image.h"
+#include "stb_image_write.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -403,6 +407,161 @@ static int service_cover(void) {
     return 1;
 }
 
+// ---------------------------------------------------------------- cover flow art
+// Decoded covers at CAT_ART px, cached on the card as JPEG (a few tens of KB
+// each) so flicking back through the library doesn't decode again.
+static void art_file(char *out, size_t n, uint32_t key) { snprintf(out, n, "%s/%08x.a%d.jpg", cache_dir, key, CAT_ART); }
+
+static int load_art(uint32_t key, const char *path, image *out) {
+    char file[600];
+    art_file(file, sizeof file, key);
+    int w = 0, h = 0, comp;
+    uint8_t *px = NULL;
+    FILE *f = fopen(file, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        uint8_t *buf = n > 0 ? malloc(n) : NULL;
+        if (buf && fread(buf, 1, n, f) == (size_t)n) px = stbi_load_from_memory(buf, (int)n, &w, &h, &comp, 4);
+        free(buf);
+        fclose(f);
+    }
+    if (px && w == CAT_ART && h == CAT_ART) {
+        out->w = w; out->h = h;
+        out->px = malloc((size_t)w * h * 4);
+        if (out->px) memcpy(out->px, px, (size_t)w * h * 4);
+        stbi_image_free(px);
+        return out->px ? 0 : -1;
+    }
+    if (px) stbi_image_free(px);
+    track_tags tg;
+    tags_read(path, &tg, 1);
+    int ok = -1;
+    if (tg.cover_data) {
+        plat_cpu_boost(1);
+        ok = image_from_cover(tg.cover_data, tg.cover_size, CAT_ART, out);
+        plat_cpu_boost(0);
+        if (ok == 0) stbi_write_jpg(file, CAT_ART, CAT_ART, 4, out->px, 90);
+    }
+    tags_free(&tg);
+    return ok;
+}
+
+// UI side: a small LRU of decoded covers, owned by the UI thread (so the
+// images it draws are never freed under it). The worker only fills a mailbox.
+#define ART_SLOTS 16
+static struct { uint32_t key; int state; image img; uint64_t used; } art[ART_SLOTS]; // state: 0 retry, 1 asked, 2 ready, 3 none
+static uint64_t art_clock;
+#define AQ 8
+static struct { uint32_t key; char path[1024]; } aq[AQ]; // requests (cm), newest last
+static int aqn;
+static struct { uint32_t key; image img; int ok; } ares[AQ]; // results (cm)
+static int aresn;
+
+const image *cat_art(const catalog *c, int album) {
+    if (!c || album < 0 || album >= c->nalbums) return NULL;
+    uint32_t key = c->albums[album].key;
+    plat_mutex_lock(cm);
+    for (int i = 0; i < aresn; i++) { // collect finished covers
+        int s = -1;
+        for (int k = 0; k < ART_SLOTS; k++) if (art[k].key == ares[i].key && art[k].state == 1) { s = k; break; }
+        if (s >= 0) { art[s].img = ares[i].img; art[s].state = ares[i].ok ? 2 : 3; }
+        else image_free(&ares[i].img);
+    }
+    aresn = 0;
+    int s = -1;
+    for (int k = 0; k < ART_SLOTS; k++) if (art[k].key == key) { s = k; break; }
+    if (s < 0) { // take an empty or the least recently used slot
+        s = 0;
+        for (int k = 1; k < ART_SLOTS; k++) if (art[k].used < art[s].used) s = k;
+        image_free(&art[s].img);
+        art[s].key = key;
+        art[s].state = 0;
+    }
+    art[s].used = ++art_clock;
+    if (art[s].state == 0) {
+        if (aqn == AQ) { // drop the oldest request; that cover is asked for again when needed
+            for (int k = 0; k < ART_SLOTS; k++) if (art[k].key == aq[0].key && art[k].state == 1) art[k].state = 0;
+            memmove(&aq[0], &aq[1], (AQ - 1) * sizeof aq[0]);
+            aqn--;
+        }
+        aq[aqn].key = key;
+        snprintf(aq[aqn].path, sizeof aq[aqn].path, "%s", c->tracks[c->albums[album].tracks[0]].path);
+        aqn++;
+        art[s].state = 1;
+    }
+    const image *out = art[s].state == 2 ? &art[s].img : NULL;
+    plat_mutex_unlock(cm);
+    return out;
+}
+
+static int service_art(void) {
+    plat_mutex_lock(cm);
+    if (!aqn) { plat_mutex_unlock(cm); return 0; }
+    aqn--;
+    uint32_t key = aq[aqn].key;
+    char path[1024];
+    snprintf(path, sizeof path, "%s", aq[aqn].path);
+    plat_mutex_unlock(cm);
+    image img = { 0 };
+    int ok = load_art(key, path, &img) == 0;
+    plat_mutex_lock(cm);
+    if (aresn < AQ) { ares[aresn].key = key; ares[aresn].img = img; ares[aresn].ok = ok; aresn++; }
+    else image_free(&img);
+    plat_mutex_unlock(cm);
+    return 1;
+}
+
+// One backdrop at a time, same hand-over as cat_cover.
+static uint32_t bd_req_key, bd_new_key; // cm
+static int bd_req;
+static char bd_req_path[1024];
+static image bd_new;
+static image bd_cur;                    // UI thread only
+static uint32_t bd_cur_key;
+
+const image *cat_backdrop(const catalog *c, int album) {
+    if (!c || album < 0 || album >= c->nalbums) return NULL;
+    uint32_t key = c->albums[album].key;
+    const image *out = bd_cur.px ? &bd_cur : NULL; // keep showing the last one meanwhile
+    if (bd_cur_key == key) return out;
+    plat_mutex_lock(cm);
+    if (bd_new_key == key) {
+        image_free(&bd_cur);
+        bd_cur = bd_new; bd_cur_key = key;
+        memset(&bd_new, 0, sizeof bd_new); bd_new_key = 0;
+        out = bd_cur.px ? &bd_cur : NULL;
+    } else if (bd_req_key != key) {
+        bd_req_key = key; bd_req = 1;
+        snprintf(bd_req_path, sizeof bd_req_path, "%s", c->tracks[c->albums[album].tracks[0]].path);
+    }
+    plat_mutex_unlock(cm);
+    return out;
+}
+
+static int service_backdrop(void) {
+    plat_mutex_lock(cm);
+    if (!bd_req) { plat_mutex_unlock(cm); return 0; }
+    bd_req = 0;
+    uint32_t key = bd_req_key;
+    char path[1024];
+    snprintf(path, sizeof path, "%s", bd_req_path);
+    plat_mutex_unlock(cm);
+    image cov = { 0 }, bg = { 0 };
+    if (load_art(key, path, &cov) == 0) {
+        plat_cpu_boost(1);
+        image_backdrop(&cov, &bg, SCREEN_W, SCREEN_H, -46, -253, 1051, 1050, 0.25f);
+        plat_cpu_boost(0);
+    }
+    image_free(&cov);
+    plat_mutex_lock(cm);
+    image_free(&bd_new);
+    bd_new = bg; bd_new_key = key; // no art: empty, so the UI stops asking
+    plat_mutex_unlock(cm);
+    return 1;
+}
+
 // ---------------------------------------------------------------- scanning
 typedef struct { char *path; uint64_t size, mtime; } found;
 
@@ -492,7 +651,7 @@ static void scan(cat_track **known, int *nknown) {
         } else {
             read_track(&out[n++], &files[i]);
             changed = 1;
-            if (!service_cover()) service_thumb(); // keep visible art coming during a long scan
+            if (!service_cover() && !service_backdrop() && !service_art()) service_thumb(); // keep visible art coming during a long scan
             if (plat_time_us() - last_pub > 2000000) { publish(out, n); last_pub = plat_time_us(); }
         }
         plat_mutex_lock(cm);
@@ -528,7 +687,7 @@ static int worker(void *arg) {
             plat_mutex_unlock(cm);
             continue;
         }
-        if (!service_cover() && !service_thumb()) plat_sleep_us(20000);
+        if (!service_cover() && !service_backdrop() && !service_art() && !service_thumb()) plat_sleep_us(20000);
     }
     return 0;
 }

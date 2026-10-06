@@ -14,8 +14,17 @@ screen-off mode for pocket listening.
 
 The first scan reads every file and can take a while for a big library (it
 runs in the background and the list fills in as it goes). After that only
-new or changed files are read. Album thumbnails are made the first time
-they're shown and cached in `ux0:data/Fidelity/cache`.
+new or changed files are read. Album thumbnails and Cover Flow art are made
+the first time they're shown and cached in `ux0:data/Fidelity/cache`.
+
+### Test albums
+Only a couple of albums on the card? `tools/make_test_albums.py` builds a
+pack of 12 placeholder albums (generated cover art, short quiet tones, proper
+tags) — copy its folders into `ux0:data/Fidelity/Music`:
+
+```
+python3 tools/make_test_albums.py test-albums   # needs Pillow and ffmpeg
+```
 
 ## Controls
 | Where | Button | Action |
@@ -26,7 +35,7 @@ they're shown and cached in `ux0:data/Fidelity/cache`.
 | | ↑ ↓ / ← → | Move / page |
 | | ✕ | Open the album or artist, play the track |
 | | ○ | Back (album / artist page) |
-| | □ | Shuffle the album (album page) |
+| | □ | Albums tab: switch list ↔ Cover Flow · album page: shuffle |
 | | △ | Now playing |
 | Now playing | ✕ | Play / pause |
 | | L / R | Previous / next track |
@@ -34,6 +43,13 @@ they're shown and cached in `ux0:data/Fidelity/cache`.
 | | □ | Shuffle |
 | | △ | Repeat: off → all → one |
 | | ○ | Back |
+
+### Cover Flow
+The Albums tab can show big covers you flick through instead of a list:
+press □ there (or Settings → Album View). ← → (or ↑ ↓) step through the
+albums, ✕ opens the one in the middle. On the touch screen, drag or flick the
+covers sideways, tap a side cover to bring it to the middle and tap the
+middle one to open it. The choice is remembered.
 
 With the screen off every control is locked, touch included, so nothing
 changes in a pocket; music keeps playing. Hold SELECT for about a second to
@@ -64,7 +80,7 @@ which accepts 44.1 kHz and 48 kHz natively, so:
 Cover art: embedded FLAC/MP3 pictures, otherwise `cover.jpg`, `folder.jpg`,
 `front.jpg` (or .png) in the album folder.
 
-Settings (last tab, shuffle, repeat) live in `ux0:data/Fidelity/settings.txt`,
+Settings (last tab, shuffle, repeat, album view) live in `ux0:data/Fidelity/settings.txt`,
 the library index in `library.idx` next to it.
 A log is written to `ux0:data/Fidelity/log.txt` on each launch.
 

@@ -160,6 +160,31 @@ int main(int argc, char **argv) {
         tap(BTN_CIRCLE);
         run_ms(300);
         shot("np06_albums_mini");
+    } else if (!strcmp(script, "covers")) {
+        // Cover Flow: switch with SQUARE, step with the d-pad, flick, tap a side cover
+        wait_scan();
+        tap(BTN_SQUARE);
+        run_ms(1500);              // settle + art + backdrop
+        shot("c01_coverflow");
+        tap(BTN_RIGHT);
+        run_ms(90);
+        shot("c02_moving");
+        run_ms(1500);
+        shot("c03_second");
+        drag(700, 250, 300, 250, 150, 0); // flick left -> forward several
+        run_ms(1800);
+        shot("c04_after_flick");
+        tap_at(120, 250);          // far-left cover: back two
+        run_ms(1500);
+        shot("c05_tap_side");
+        tap_at(480, 250);          // centre cover opens the album
+        run_ms(400);
+        shot("c06_album_page");
+        tap(BTN_CIRCLE);
+        run_ms(300);
+        tap(BTN_SQUARE);           // back to the list, remembers it
+        run_ms(200);
+        shot("c07_list_again");
     } else if (!strcmp(script, "audio")) {
         // play the first album in order and let it run to the end (gapless check)
         host_realtime_audio = 0;
