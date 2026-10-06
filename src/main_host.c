@@ -87,10 +87,27 @@ int main(int argc, char **argv) {
         run_ms(300);
         shot("10_artist_page");
         tap(BTN_TRIANGLE);         // Now playing
-        tap(BTN_SELECT);           // screen off
-        tap(BTN_START);            // pause while off
-        tap(BTN_SELECT);           // wake
-        shot("11_paused_after_wake");
+        player_status st0, st1;
+        tap(BTN_START);            // pause, so position and track stay put
+        player_get_status(&st0);
+        static char notice[1024];  // capture the frame drawn when locking
+        snprintf(notice, sizeof notice, "%s/11_lock_notice.png", outdir);
+        host_shot_path = notice;
+        tap(BTN_SELECT);           // lock: notice, then screen off
+        run_ms(1400);
+        tap(BTN_START);            // all ignored while locked
+        tap(BTN_R);
+        tap(BTN_CROSS);
+        tap_at(698, 430);
+        tap(BTN_SELECT);           // a quick press doesn't wake it
+        host_buttons = BTN_SELECT; // holding SELECT does
+        run_ms(1100);
+        host_buttons = 0;
+        run_ms(100);
+        player_get_status(&st1);
+        printf("locked: before index %d paused %d, after index %d paused %d -> %s\n", st0.index, st0.paused,
+               st1.index, st1.paused, st0.index == st1.index && st0.paused == st1.paused ? "UNCHANGED" : "CHANGED");
+        shot("12_awake_unchanged");
     } else if (!strcmp(script, "touch")) {
         wait_scan();
         shot("t01_albums");

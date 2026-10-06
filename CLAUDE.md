@@ -16,6 +16,9 @@ from the memory card. See README.md for controls and the user-facing feature lis
   call `sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT)` every loop.
 - On PS button / resume from sleep (`sceAppMgrReceiveSystemEvent`) the backlight is
   restored so the user never lands on a dark home screen.
+- Pocket mode locks all controls (user request: accidental skips in a pocket):
+  SELECT shows "Controls locked" for ~1.2 s, then the backlight goes off;
+  only holding SELECT ~1 s wakes it (the locking press must be released first).
 - Track changes and scrubbing are fast since the background loader / cached
   Now playing layer / MP3 indexer work (PR #2) — confirmed by the user on hardware.
 

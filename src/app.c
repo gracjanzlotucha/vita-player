@@ -41,7 +41,15 @@ static int np_back = V_LIBRARY;              // where O goes from Now playing
 static int page_album = -1, page_artist = -1; // open album / artist page
 static uint32_t page_album_key;
 static int album_from_artist;                // album page opened from an artist
-static int dirty = 1, screen_off;
+static int dirty = 1;
+// Pocket mode: SELECT shows a short notice, then turns the backlight off.
+// While locked every control is ignored (touch too); holding SELECT for a
+// second wakes it, so nothing changes by accident in a pocket.
+static int screen_off;
+static uint64_t dark_at;         // when the backlight goes off; 0 once it is
+static int wake_armed;           // SELECT was released since locking
+static uint64_t wake_hold;       // when the waking SELECT press started
+#define WAKE_HOLD_US 1000000
 static uint64_t last_draw;
 
 static uint32_t prev_buttons;
@@ -1251,6 +1259,33 @@ int app_init(const char *asset_dir) {
 
 void app_force_redraw(void) { dirty = 1; np_static_dirty = mini_dirty = 1; }
 
+static void lock_screen(void) {
+    screen_off = 1;
+    wake_armed = 0;
+    wake_hold = 0;
+    dark_at = plat_time_us() + 1200000;
+    tc.down = 0;
+    tc.blocked = 1;
+    scrub = -1;
+    if (L.l) L.l->vel = 0;
+    int stride;
+    uint32_t *px = plat_backbuffer(&stride);
+    gfx_begin(&cv, px, SCREEN_W, SCREEN_H, stride);
+    gfx_clear(&cv, RGB(0, 0, 0));
+    const char *t1 = "Controls locked", *t2 = "Hold SELECT to wake the screen";
+    text_at(FONT_GEIST, 20, 24, (SCREEN_W - text_width(FONT_GEIST, 20, t1)) / 2.0f, 238, t1, C_TEXT, 0);
+    text_at(FONT_PIXEL, 12, 0, (SCREEN_W - text_width(FONT_PIXEL, 12, t2)) / 2.0f, 274, t2, C_TEXT2, 0);
+    plat_present();
+}
+
+static void unlock_screen(void) {
+    if (!dark_at) plat_display_on();
+    screen_off = 0;
+    dark_at = 0;
+    tc.blocked = 1; // ignore a finger already on the glass
+    dirty = 1;
+}
+
 int app_step(uint32_t b) {
     player_status s;
     player_get_status(&s);
@@ -1262,28 +1297,29 @@ int app_step(uint32_t b) {
     if (plat_focus_event()) {
         tc.blocked = 1;
         scrub = -1;
-        if (screen_off) {
-            screen_off = 0;
-            plat_display_on();
-            dirty = 1;
-        }
+        if (screen_off) unlock_screen();
     }
 
     catalog *nc = cat_poll();
     if (nc) adopt_catalog(nc, &s);
 
     if (screen_off) {
-        // pocket mode: only transport controls, SELECT wakes the screen
-        if (pressed(BTN_START, b, 0)) player_toggle_pause();
-        if (pressed(BTN_L, b, 0)) player_prev();
-        if (pressed(BTN_R, b, 0)) player_next();
-        if (pressed(BTN_SELECT, b, 0)) {
-            screen_off = 0;
-            plat_display_on();
-            tc.blocked = 1;
-            dirty = 1;
+        uint64_t now = plat_time_us();
+        if (dark_at && now >= dark_at) { // notice shown long enough: lights out
+            int stride;
+            uint32_t *px = plat_backbuffer(&stride);
+            gfx_begin(&cv, px, SCREEN_W, SCREEN_H, stride);
+            gfx_clear(&cv, RGB(0, 0, 0)); // black frame so nothing flashes on wake
+            plat_present();
+            plat_display_off();
+            dark_at = 0;
         }
-        prev_buttons = b;
+        if (!(b & BTN_SELECT)) { wake_armed = 1; wake_hold = 0; }
+        else if (wake_armed) {
+            if (!wake_hold) wake_hold = now;
+            else if (now - wake_hold >= WAKE_HOLD_US) unlock_screen();
+        }
+        prev_buttons = b; // so the waking SELECT doesn't count as a new press
         plat_sleep_us(20000);
         return 0;
     }
@@ -1292,18 +1328,7 @@ int app_step(uint32_t b) {
     b |= handle_touch(&s);
 
     if (pressed(BTN_SELECT, b, 0)) {
-        screen_off = 1;
-        tc.down = 0;
-        tc.blocked = 1;
-        scrub = -1;
-        if (L.l) L.l->vel = 0;
-        // black frame first so nothing flashes when it comes back
-        int stride;
-        uint32_t *px = plat_backbuffer(&stride);
-        gfx_begin(&cv, px, SCREEN_W, SCREEN_H, stride);
-        gfx_clear(&cv, RGB(0, 0, 0));
-        plat_present();
-        plat_display_off();
+        lock_screen();
         prev_buttons = b;
         return 0;
     }

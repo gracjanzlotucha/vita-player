@@ -21,7 +21,7 @@ they're shown and cached in `ux0:data/Fidelity/cache`.
 | Where | Button | Action |
 |---|---|---|
 | Everywhere | START | Play / pause |
-| | SELECT | Screen off (SELECT again to wake) |
+| | SELECT | Screen off and lock the controls (hold SELECT ~1 s to wake) |
 | Library | L / R | Change tab (Albums, Tracks, Artists, Settings) |
 | | ↑ ↓ / ← → | Move / page |
 | | ✕ | Open the album or artist, play the track |
@@ -35,7 +35,9 @@ they're shown and cached in `ux0:data/Fidelity/cache`.
 | | △ | Repeat: off → all → one |
 | | ○ | Back |
 
-With the screen off only START, L, R (previous / next) and SELECT do anything.
+With the screen off every control is locked, touch included, so nothing
+changes in a pocket; music keeps playing. Hold SELECT for about a second to
+wake it. The Vita's volume buttons still work.
 
 ### Touch
 Everything can also be done on the touch screen: tap a tab, an album, artist
