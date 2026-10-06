@@ -55,13 +55,18 @@ const image *cat_thumb(const catalog *c, int album, int size);
 // One larger cover (e.g. the album page header), decoded on the worker.
 // Call from the UI thread only; NULL until ready or if there is no art.
 const image *cat_cover(const catalog *c, int album, int size);
-// Cover art for Cover Flow (CAT_ART px square), decoded on the worker and
-// cached on the card as JPEG; the newest request is served first. UI thread
-// only: a pointer stays valid until the next cat_art() call.
-#define CAT_ART 340
-const image *cat_art(const catalog *c, int album);
-// The blurred full-screen background for an album (Now Playing style).
-// UI thread only; NULL until ready. Stays valid until it changes.
-const image *cat_backdrop(const catalog *c, int album);
+// Cover art for Cover Flow, decoded on the worker and cached on the card as
+// JPEG; the newest request is served first. Each cover is kept at the Cover
+// Flow sizes (CAT_ART, 304, 251 px); this returns the smallest at least
+// `size` wide (or the smallest there is). NULL until ready. UI thread only:
+// pointers stay valid while the album is asked for every frame (16-slot LRU).
+#define CAT_ART 337
+#define CAT_ART_LEVELS 3
+const image *cat_art(const catalog *c, int album, int size);
+// The blurred full-screen background for an album (Now Playing style), built
+// on the worker. Asks for it and returns 0 until it is ready; then moves it
+// into *out (the caller frees it; empty = no art) and returns 1. out may be
+// NULL to only ask. UI thread only.
+int cat_backdrop(const catalog *c, int album, image *out);
 // Natural, case-insensitive compare: "2 - x" < "10 - y"
 int  natcmp(const char *a, const char *b);

@@ -27,12 +27,19 @@ from the memory card. See README.md for controls and the user-facing feature lis
 - Touch controls (front panel coordinates assumed 1920x1088 → halved to 960x544;
   touch sampling is stopped while the screen is off).
 - Whether the BGM port ever refuses to open (there is a MAIN-port 48 kHz fallback).
+- Cover Flow frame rate after the speed-up (present thread, art levels,
+  culling, 444 MHz while animating) and the backdrop cross-fade; the user saw
+  ~30 fps before. The log line "coverflow: ... fps" tells.
 
 ## Architecture
 - Threads: UI = main thread (core 0); audio thread (prio 0x50, core 1); three
   low-priority workers on core 2 — the track info loader (`app.c`), the MP3
-  seek indexer (`player.c`) and the library scanner/thumbnailer (`catalog.c`). `plat_cpu_boost()` raises the clock 333 → 444 MHz
-  only while cover art is decoded.
+  seek indexer (`player.c`) and the library scanner/thumbnailer (`catalog.c`) —
+  plus the present thread (prio 0x60, core 2, `platform_vita.c`): the UI draws
+  into one of two RAM buffers while it copies the other to CDRAM and waits for
+  vblank (frames are always fully redrawn, so the alternating buffers are
+  safe). `plat_cpu_boost()` raises the clock 333 → 444 MHz while cover art is
+  decoded and while Cover Flow animates.
 - `src/platform.h` is the only seam between app code and the console.
   `platform_vita.c` implements it with Vita APIs; `platform_host.c` is a desktop
   stand-in that writes frames to PNG and audio to WAV.
@@ -52,10 +59,11 @@ from the memory card. See README.md for controls and the user-facing feature lis
   together); artists are album artists. The UI takes published catalogs from
   `cat_poll()`. Thumbnails (48/36 px) are made on demand, newest request first,
   and cached as raw RGBA in `ux0:data/Fidelity/cache/<key>.t48`; `cat_cover()`
-  gives the 120 px album-page header. Cover Flow uses `cat_art()` (340 px,
-  16-slot LRU owned by the UI thread, cached as `<key>.a340.jpg`) and
-  `cat_backdrop()` (full-screen blurred backdrop, one at a time; keeps
-  returning the previous one until the new one is built).
+  gives the 120 px album-page header. Cover Flow uses `cat_art()` (337 px
+  plus box-filtered 304/251 px levels, 16-slot LRU owned by the UI thread,
+  cached as `<key>.a337.jpg`) and `cat_backdrop()` (full-screen blurred
+  backdrop, one at a time, handed over to the UI which frees it). Worker
+  order: cover, art, backdrop, thumbnails.
 - `app.c`: library (tabs Albums/Tracks/Artists/Settings, album and artist
   pages, mini player), now playing, input, screen-off mode, settings.
   Track changes never block the UI: `loader_thread` reads tags, decodes the
@@ -70,9 +78,12 @@ from the memory card. See README.md for controls and the user-facing feature lis
   scrubbing (`player_seek_to` on release).
   Cover Flow (`album_view`): `cf_pos` (float, in albums) eases towards the
   selection in `cf_step()`; covers are placed by interpolating the Figma
-  keyframes `CFK`. While moving it draws nearest-neighbour without shadows;
-  once still it composes one smooth frame into `cf_still` (keyed by the
-  selection and the image pixel pointers) and just copies it.
+  keyframes `CFK`. Same drawing moving or still (no shadow — it popped):
+  `cat_art` levels (337/304/251) drawn by `gfx_cover` at ~1:1; nothing is
+  drawn under a nearer opaque cover, and the backdrop only where no cover
+  is. The backdrop is fetched once the selection rests 150 ms and
+  cross-fades (450 ms, `gfx_crossfade_span`, NEON) — one fade at a time.
+  The log gets "coverflow: N frames, fps, draw ms" after each animation.
 - `gfx.c`: software renderer (anti-aliased SDF shapes, images, stb_truetype text)
   into a RAM buffer that is copied to a CDRAM framebuffer on present. Also
   rasterises SVG path data into coverage masks (`mask_from_path`), used for

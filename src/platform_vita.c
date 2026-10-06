@@ -28,7 +28,39 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 static SceUID fb_block[2];
 static void *fb_mem[2];
 static int fb_cur;
-static uint32_t *render_buf; // cached RAM; copied to CDRAM on present
+// The app draws into one of two cached-RAM buffers while a present thread
+// (core 2) copies the other to CDRAM and waits for vblank, so the copy and
+// the wait overlap with drawing the next frame.
+static uint32_t *render_buf[2];
+static int rb_cur;                    // the buffer the app draws into
+static volatile int present_buf;      // the one handed to the present thread
+static SceUID present_go = -1, present_idle = -1;
+static void present_wait(void);
+
+static void flip(const uint32_t *src) {
+    fb_cur ^= 1;
+    memcpy(fb_mem[fb_cur], src, SCREEN_W * SCREEN_H * 4);
+    SceDisplayFrameBuf f;
+    memset(&f, 0, sizeof f);
+    f.size = sizeof f;
+    f.base = fb_mem[fb_cur];
+    f.pitch = SCREEN_W;
+    f.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
+    f.width = SCREEN_W;
+    f.height = SCREEN_H;
+    sceDisplaySetFrameBuf(&f, SCE_DISPLAY_SETBUF_NEXTFRAME);
+    sceDisplayWaitVblankStart();
+}
+
+static int present_thread(SceSize args, void *argp) {
+    (void)args; (void)argp;
+    for (;;) {
+        sceKernelWaitSema(present_go, 1, NULL);
+        flip(render_buf[present_buf]);
+        sceKernelSignalSema(present_idle, 1);
+    }
+    return 0;
+}
 
 static int audio_port = -1;
 static int audio_rate;
@@ -42,7 +74,19 @@ int plat_init(void) {
         sceKernelGetMemBlockBase(fb_block[i], &fb_mem[i]);
         memset(fb_mem[i], 0, FB_SIZE);
     }
-    render_buf = (uint32_t *)memalign(64, SCREEN_W * SCREEN_H * 4);
+    for (int i = 0; i < 2; i++) {
+        render_buf[i] = (uint32_t *)memalign(64, SCREEN_W * SCREEN_H * 4);
+        if (!render_buf[i]) return -1;
+        memset(render_buf[i], 0, SCREEN_W * SCREEN_H * 4);
+    }
+    // above the background workers on core 2, below the audio thread
+    present_go = sceKernelCreateSema("fid_present_go", 0, 0, 1, NULL);
+    present_idle = sceKernelCreateSema("fid_present_idle", 0, 1, 1, NULL);
+    SceUID pt = sceKernelCreateThread("fid_present", present_thread, 0x60, 64 * 1024, 0, SCE_KERNEL_CPU_MASK_USER_2, NULL);
+    if (present_go < 0 || present_idle < 0 || pt < 0 || sceKernelStartThread(pt, 0, NULL) < 0) {
+        plat_log("present thread unavailable, presenting inline");
+        present_go = -1;
+    }
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
     // Decoding FLAC is cheap, but give the UI headroom for cover art scaling.
@@ -52,25 +96,29 @@ int plat_init(void) {
 }
 
 void plat_shutdown(void) {
+    present_wait();
     plat_display_on();
     if (audio_port >= 0) sceAudioOutReleasePort(audio_port);
 }
 
-uint32_t *plat_backbuffer(int *stride) { *stride = SCREEN_W; return render_buf; }
+uint32_t *plat_backbuffer(int *stride) { *stride = SCREEN_W; return render_buf[rb_cur]; }
 
+// Hands the finished frame over and returns; the app then draws the next
+// one into the other buffer. Waits only if the previous frame is still
+// being shown, which paces the loop at the display rate.
 void plat_present(void) {
-    fb_cur ^= 1;
-    memcpy(fb_mem[fb_cur], render_buf, SCREEN_W * SCREEN_H * 4);
-    SceDisplayFrameBuf f;
-    memset(&f, 0, sizeof f);
-    f.size = sizeof f;
-    f.base = fb_mem[fb_cur];
-    f.pitch = SCREEN_W;
-    f.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
-    f.width = SCREEN_W;
-    f.height = SCREEN_H;
-    sceDisplaySetFrameBuf(&f, SCE_DISPLAY_SETBUF_NEXTFRAME);
-    sceDisplayWaitVblankStart();
+    if (present_go < 0) { flip(render_buf[rb_cur]); return; }
+    sceKernelWaitSema(present_idle, 1, NULL);
+    present_buf = rb_cur;
+    sceKernelSignalSema(present_go, 1);
+    rb_cur ^= 1;
+}
+
+// the last frame is on screen (before the backlight goes off / at exit)
+static void present_wait(void) {
+    if (present_go < 0) return;
+    sceKernelWaitSema(present_idle, 1, NULL);
+    sceKernelSignalSema(present_idle, 1);
 }
 
 // Screen off = backlight to 0. scePowerRequestDisplayOff() puts the console
@@ -80,6 +128,7 @@ static int saved_brightness = -1;
 static int display_is_off;
 
 void plat_display_off(void) {
+    present_wait(); // the black frame first
     int b = 0;
     if (sceRegMgrGetKeyInt("/CONFIG/DISPLAY", "brightness", &b) >= 0 && b > 0) saved_brightness = b;
     int r = sceAVConfigSetDisplayBrightness(0);

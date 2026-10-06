@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
@@ -239,6 +242,132 @@ void gfx_image_scaled(canvas *c, const image *img, int x, int y, int w, int h, f
             blend(&dst[xx], p, cov);
         }
     }
+}
+
+// Cover Flow covers. The caller passes an image already close to w x h (a
+// pre-scaled level), so nearest sampling looks the same moving or still and
+// at rest is an exact copy. Only columns [vx0, vx1) are drawn: the rest is
+// under nearer covers. Corner coverage comes from a small table, so the
+// inner loops are a lookup and a store.
+void gfx_cover(canvas *c, const image *img, int x, int y, int w, int h, int r, int shade, int alpha, int vx0, int vx1) {
+    if (!img || !img->px || w <= 0 || h <= 0 || alpha <= 0 || w > 2048) return;
+    if (r > 31) r = 31;
+    if (2 * r + 2 > w || 2 * r + 2 > h) r = 0;
+    if (vx0 < x) vx0 = x;
+    if (vx1 > x + w) vx1 = x + w;
+    if (vx0 < c->cx0) vx0 = c->cx0;
+    if (vx1 > c->cx1) vx1 = c->cx1;
+    if (vx1 <= vx0) return;
+    static int sx[2048];
+    static uint8_t cov[32][32];
+    for (int i = vx0 - x; i < vx1 - x; i++) sx[i] = (int)(((2LL * i + 1) * img->w) / (2LL * w));
+    for (int j = 0; j <= r; j++)
+        for (int i = 0; i <= r; i++) cov[j][i] = (uint8_t)(rbox_cov(i + 0.5f, j + 0.5f, 0, 0, w, h, r) * 255 + 0.5f);
+    uint32_t s = (uint32_t)(shade >= 255 ? 256 : shade < 0 ? 0 : shade + (shade >> 7)); // 0..256
+    for (int j = 0; j < h; j++) {
+        int yy = y + j;
+        if (yy < c->cy0 || yy >= c->cy1) continue;
+        const uint32_t *src = img->px + (int)(((2LL * j + 1) * img->h) / (2LL * h)) * img->w;
+        uint32_t *d = c->px + yy * c->stride;
+        int cj = j <= r ? j : j >= h - 1 - r ? h - 1 - j : -1;
+        if (cj < 0 && alpha >= 255) { // plain rows: the bulk of the work
+            if (s == 256)
+                for (int xx = vx0; xx < vx1; xx++) d[xx] = src[sx[xx - x]] | 0xFF000000u;
+            else
+                for (int xx = vx0; xx < vx1; xx++) {
+                    uint32_t p = src[sx[xx - x]];
+                    d[xx] = (((p & 0x00FF00FFu) * s >> 8) & 0x00FF00FFu) | (((p & 0x0000FF00u) * s >> 8) & 0x0000FF00u) | 0xFF000000u;
+                }
+            continue;
+        }
+        for (int xx = vx0; xx < vx1; xx++) {
+            int i = xx - x;
+            uint32_t p = src[sx[i]];
+            if (s < 256) p = (((p & 0x00FF00FFu) * s >> 8) & 0x00FF00FFu) | (((p & 0x0000FF00u) * s >> 8) & 0x0000FF00u);
+            int a = alpha;
+            if (cj >= 0) {
+                int ci = i <= r ? i : i >= w - 1 - r ? w - 1 - i : -1;
+                if (ci >= 0) a = a * cov[cj][ci] / 255;
+            }
+            blend(&d[xx], p | 0xFF000000u, a);
+        }
+    }
+}
+
+// Row y, columns [x0, x1) of two full-screen images, cross-faded: t = 0 is
+// all a, 256 all b. A missing image is black.
+void gfx_crossfade_span(canvas *c, const image *a, const image *b, int t, int y, int x0, int x1) {
+    static uint32_t black[2048];
+    if (!black[0]) for (int i = 0; i < 2048; i++) black[i] = 0xFF000000u;
+    if (x0 < c->cx0) x0 = c->cx0;
+    if (x1 > c->cx1) x1 = c->cx1;
+    if (y < c->cy0 || y >= c->cy1 || x1 <= x0 || x1 > 2048) return;
+    const uint32_t *pa = a && a->px && y < a->h && x1 <= a->w ? a->px + y * a->w : black;
+    const uint32_t *pb = b && b->px && y < b->h && x1 <= b->w ? b->px + y * b->w : black;
+    uint32_t *d = c->px + y * c->stride;
+    if (t <= 0 || pa == pb) { memcpy(d + x0, (pa == black ? black : pa + x0), (size_t)(x1 - x0) * 4); return; }
+    if (t >= 256) { memcpy(d + x0, (pb == black ? black : pb + x0), (size_t)(x1 - x0) * 4); return; }
+    if (pa != black) pa += x0;
+    if (pb != black) pb += x0;
+    d += x0;
+    int n = x1 - x0, i = 0;
+#ifdef __ARM_NEON
+    uint8x8_t wa = vdup_n_u8((uint8_t)(256 - t)), wb = vdup_n_u8((uint8_t)t);
+    for (; i + 4 <= n; i += 4) { // 4 pixels = 16 bytes per step
+        uint8x16_t va = vld1q_u8((const uint8_t *)(pa + i)), vb = vld1q_u8((const uint8_t *)(pb + i));
+        uint16x8_t lo = vmlal_u8(vmull_u8(vget_low_u8(va), wa), vget_low_u8(vb), wb);
+        uint16x8_t hi = vmlal_u8(vmull_u8(vget_high_u8(va), wa), vget_high_u8(vb), wb);
+        vst1q_u8((uint8_t *)(d + i), vcombine_u8(vshrn_n_u16(lo, 8), vshrn_n_u16(hi, 8)));
+    }
+#endif
+    uint32_t ta = (uint32_t)(256 - t), tb = (uint32_t)t;
+    for (; i < n; i++) {
+        uint32_t p = pa[i], q = pb[i];
+        uint32_t rb = (((p & 0x00FF00FFu) * ta + (q & 0x00FF00FFu) * tb) >> 8) & 0x00FF00FFu;
+        uint32_t g = (((p & 0x0000FF00u) * ta + (q & 0x0000FF00u) * tb) >> 8) & 0x0000FF00u;
+        d[i] = rb | g | 0xFF000000u;
+    }
+}
+
+// Box-filtered downscale (each output pixel averages the source pixels it
+// covers, with fractional edges). Thread-safe: used on the catalog worker.
+int image_downscale(const image *src, image *out, int w, int h) {
+    if (!src || !src->px || w <= 0 || h <= 0 || w > src->w || h > src->h) return -1;
+    out->px = malloc((size_t)w * h * 4);
+    if (!out->px) return -1;
+    out->w = w; out->h = h;
+    float *acc = malloc((size_t)w * 4 * sizeof *acc);
+    if (!acc) { image_free(out); return -1; }
+    float kx = (float)src->w / w, ky = (float)src->h / h;
+    for (int oy = 0; oy < h; oy++) {
+        memset(acc, 0, (size_t)w * 4 * sizeof *acc);
+        float y0 = oy * ky, y1 = y0 + ky;
+        for (int sy = (int)y0; sy < src->h && sy < y1; sy++) {
+            float wy = fminf(y1, sy + 1.0f) - fmaxf(y0, (float)sy);
+            if (wy <= 0) continue;
+            const uint32_t *row = src->px + sy * src->w;
+            for (int ox = 0; ox < w; ox++) {
+                float x0 = ox * kx, x1 = x0 + kx;
+                float *a = acc + ox * 4;
+                for (int sx = (int)x0; sx < src->w && sx < x1; sx++) {
+                    float wgt = (fminf(x1, sx + 1.0f) - fmaxf(x0, (float)sx)) * wy;
+                    uint32_t p = row[sx];
+                    a[0] += (p & 255) * wgt; a[1] += ((p >> 8) & 255) * wgt; a[2] += ((p >> 16) & 255) * wgt; a[3] += (p >> 24) * wgt;
+                }
+            }
+        }
+        float inv = 1.0f / (kx * ky);
+        for (int ox = 0; ox < w; ox++) {
+            uint32_t p = 0;
+            for (int k = 0; k < 4; k++) {
+                int v = (int)(acc[ox * 4 + k] * inv + 0.5f);
+                p |= (uint32_t)(v > 255 ? 255 : v) << (8 * k);
+            }
+            out->px[oy * w + ox] = p;
+        }
+    }
+    free(acc);
+    return 0;
 }
 
 // Blurred cover backgrounds, per the Figma "Background" layers: the cover

@@ -711,126 +711,203 @@ static void draw_mini(const player_status *s) {
 
 // ---------------------------------------------------------------- cover flow
 // Figma "Albums" (42:231): the centred cover 337 px at (312, 72), its
-// neighbours 304 x 303 at y 89 and 251 at y 115, 169 / 318.5 px off centre,
-// dimmed to 50% over black, r12, a soft shadow; the album's blurred cover
-// behind at 25%; title / artist / pills under the centre cover. Positions in
-// between are interpolated, so flicking animates; beyond the second
-// neighbour covers shrink and fade out.
-typedef struct { float off, w, h, top, shade; } cf_key;
+// neighbours 304 at y 89 and 251 at y 115, 169 / 318.5 px off centre, dimmed
+// to 50% over black, r12; the album's blurred cover behind at 25%; title /
+// artist / pills under the centre cover. Positions in between are
+// interpolated, so flicking animates; beyond the second neighbour covers
+// shrink and fade out. (The Figma drop shadow is left out: too slow to
+// draw while moving, and it popped in and out.)
+// Speed: covers come pre-scaled to the keyframe sizes (cat_art levels), so
+// drawing is nearest sampling at ~1:1; nothing is drawn under a nearer
+// cover, and the backdrop only where no cover is. The CPU runs at 444 MHz
+// while anything moves.
+typedef struct { float off, w, top, shade; } cf_key;
 static const cf_key CFK[4] = {
-    { 0, 337, 337, 72, 255 }, { 169, 304, 303, 89, 128 }, { 318.5f, 251, 251, 115, 128 }, { 430, 200, 200, 140, 128 },
+    { 0, 337, 72, 255 }, { 169, 304, 89, 128 }, { 318.5f, 251, 115, 128 }, { 430, 200, 140, 128 },
 };
-static image cf_still;          // the composed view while nothing moves
-static uint32_t cf_still_sig;
-static const image *cf_bd;      // backdrop being shown
+#define CF_R 12
+#define CF_FADE_US 450000       // backdrop cross-fade
+#define CF_SETTLE_US 150000     // selection unchanged this long: fetch its backdrop
+static image cf_bd_a, cf_bd_b;  // backdrop fading out / in (or shown)
+static uint32_t cf_bd_key;      // album key of cf_bd_b; 0 none yet
+static uint64_t cf_bd_t0;       // fade start; 0 when not fading
+static int cf_sel_seen = -1;
+static uint64_t cf_sel_at;
+static int cf_boosted;
+static struct { uint64_t t0, last; int frames; float draw_ms, draw_max; } cf_perf;
 
-static void cf_slot(float d, int *x, int *y, int *w, int *h, int *shade, int *alpha) {
+typedef struct { int i, x, y, w, h, shade, alpha, vx0, vx1; } cf_cover;
+
+static void cf_slot(float d, cf_cover *c) {
     float a = fabsf(d);
     if (a > 3) a = 3;
     int i = a >= 3 ? 2 : (int)a;
     float t = a - i;
     const cf_key *k0 = &CFK[i], *k1 = &CFK[i + 1];
-    float off = k0->off + (k1->off - k0->off) * t, fw = k0->w + (k1->w - k0->w) * t, fh = k0->h + (k1->h - k0->h) * t;
+    float off = k0->off + (k1->off - k0->off) * t, fw = k0->w + (k1->w - k0->w) * t;
     float cx = 480.5f + (d < 0 ? -off : off);
-    *w = (int)lroundf(fw); *h = (int)lroundf(fh);
-    *x = (int)lroundf(cx - fw / 2);
-    *y = (int)lroundf(k0->top + (k1->top - k0->top) * t);
-    *shade = (int)lroundf(k0->shade + (k1->shade - k0->shade) * t);
-    *alpha = a <= 2 ? 255 : (int)(255 * (3 - a));
+    c->w = c->h = (int)lroundf(fw);
+    c->x = (int)lroundf(cx - fw / 2);
+    c->y = (int)lroundf(k0->top + (k1->top - k0->top) * t);
+    c->shade = (int)lroundf(k0->shade + (k1->shade - k0->shade) * t);
+    c->alpha = a <= 2 ? 255 : (int)(255 * (3 - a));
 }
 
-// covers + details; smooth = bilinear and shadows (still frames)
-static void draw_covers(int smooth) {
-    int n = cat->nalbums;
-    int c0 = (int)floorf(cf_pos);
-    int idx[10], cnt = 0;
-    for (int i = c0 - 3; i <= c0 + 4; i++) if (i >= 0 && i < n && fabsf(i - cf_pos) < 3) idx[cnt++] = i;
-    // farthest first, so nearer covers overlap them
-    for (int a = 0; a < cnt; a++)
-        for (int b = a + 1; b < cnt; b++)
-            if (fabsf(idx[b] - cf_pos) > fabsf(idx[a] - cf_pos)) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
-    for (int k = 0; k < cnt; k++) {
-        int i = idx[k], x, y, w, h, shade, alpha;
-        cf_slot(i - cf_pos, &x, &y, &w, &h, &shade, &alpha);
-        if (smooth) // drop shadow (12, 4), blur 25, 25% black
-            for (int r = 5; r >= 1; r--) gfx_rrect(&cv, x + 12 - r * 4, y + 4 - r * 4, w + r * 8, h + r * 8, 12 + r * 4, RGBA(0, 0, 0, alpha * 12 / 255));
-        const image *img = cat_art(cat, i);
-        if (!img) img = cat_thumb(cat, i, 48); // until the big one arrives
-        if (img) gfx_image_scaled(&cv, img, x, y, w, h, 12, shade, alpha, smooth);
-        else gfx_rrect(&cv, x, y, w, h, 12, WITH_ALPHA(col_mix(RGB(0, 0, 0), C_PLACEH, shade / 255.0f), alpha));
-    }
-    // details of the album in (or heading to) the centre
-    int sel = lst_tab[TAB_ALBUMS].sel;
-    const cat_album *al = &cat->albums[sel];
-    const cat_track *t = &cat->tracks[al->tracks[0]];
-    char q[40];
-    fmt_quality(q, sizeof q, t->fmt, t->bits, t->rate);
-    const char *p[2] = { format_label(t->fmt), q };
-    // pills beside the title as in Figma; a title too long for that moves
-    // them down to the artist line
-    float pw = pill_w(p[0]) + 8 + pill_w(p[1]);
-    int low = text_width(FONT_GEIST_MEDIUM, 24, al->title) > 644 - 12 - pw - 312;
-    float pl = pills_right(644, low ? 467 : 435, p, 2);
-    text_at(FONT_GEIST_MEDIUM, 24, 0, 312, 429, al->title, C_TEXT, low ? 644 - 312 : (int)(pl - 12 - 312));
-    text_at(FONT_GEIST, 16, 0, 312, 467, al->artist, C_TEXT2, (int)(low ? pl - 12 - 312 : 644 - 312));
-}
+static int cf_fading(uint64_t now) { return cf_bd_t0 && now - cf_bd_t0 < CF_FADE_US; }
 
 static int cf_moving(void) {
     return (tc.down && tc.z.kind == Z_COVERS && tc.moved) || fabsf(cf_pos - lst_tab[TAB_ALBUMS].sel) > 0.001f;
 }
 
-static void draw_coverflow(void) {
+// backdrop of the selected album: asked for once the selection rests a
+// moment, cross-faded in when it arrives (one fade at a time, never cut short)
+static void cf_backdrop_step(uint64_t now) {
     int sel = lst_tab[TAB_ALBUMS].sel;
-    if (!cf_moving()) cf_bd = cat_backdrop(cat, sel); // only once it has settled
-    if (cf_moving()) {
-        if (cf_bd) gfx_blit(&cv, cf_bd, 0, 0); else gfx_clear(&cv, RGB(0, 0, 0));
-        draw_covers(0);
-    } else {
-        // still: compose once (smooth + shadows), then just copy it
-        uint32_t sig = 2166136261u ^ (uint32_t)sel;
-        // pixel pointers, not image ones: the catalog reuses its image structs
-        sig = (sig ^ (uint32_t)(uintptr_t)(cf_bd ? cf_bd->px : NULL)) * 16777619u;
-        for (int i = sel - 2; i <= sel + 2; i++) {
-            if (i < 0 || i >= cat->nalbums) continue;
-            const image *a = cat_art(cat, i);
-            if (!a) a = cat_thumb(cat, i, 48);
-            sig = (sig ^ (uint32_t)(uintptr_t)(a ? a->px : NULL)) * 16777619u;
-        }
-        if (!cf_still.px && (cf_still.px = malloc(SCREEN_W * SCREEN_H * 4))) { cf_still.w = SCREEN_W; cf_still.h = SCREEN_H; cf_still_sig = 0; }
-        if (cf_still.px && sig != cf_still_sig) {
-            canvas screen = cv;
-            gfx_begin(&cv, cf_still.px, SCREEN_W, SCREEN_H, SCREEN_W);
-            if (cf_bd) gfx_blit(&cv, cf_bd, 0, 0); else gfx_clear(&cv, RGB(0, 0, 0));
-            draw_covers(1);
-            cv = screen;
-            cf_still_sig = sig;
-        }
-        if (cf_still.px) gfx_blit(&cv, &cf_still, 0, 0);
-    }
-    hot(0, 52, SCREEN_W, 400, -1, Z_COVERS, 0);
-    gfx_rect(&cv, 0, 0, SCREEN_W, 35, RGB(0, 0, 0)); // the top bar is black here
+    if (sel != cf_sel_seen) { cf_sel_seen = sel; cf_sel_at = now; }
+    if (cf_bd_t0 && !cf_fading(now)) { cf_bd_t0 = 0; image_free(&cf_bd_a); } // fade done
+    uint32_t key = cat->albums[sel].key;
+    if (key == cf_bd_key || now - cf_sel_at < CF_SETTLE_US) return;
+    if (cf_fading(now)) { cat_backdrop(cat, sel, NULL); return; } // start building it meanwhile
+    image img;
+    if (!cat_backdrop(cat, sel, &img)) return;
+    image_free(&cf_bd_a);
+    cf_bd_a = cf_bd_b;
+    cf_bd_b = img;
+    cf_bd_key = key;
+    cf_bd_t0 = now;
 }
 
-// one animation tick: ease the position towards the selection
+static void cf_boost(int on) {
+    if (on != cf_boosted) { plat_cpu_boost(on); cf_boosted = on; }
+}
+
+static void draw_coverflow(void) {
+    uint64_t t_start = plat_time_us();
+    int n = cat->nalbums, sel = lst_tab[TAB_ALBUMS].sel;
+    // warm the art cache around where we're heading (asked first, so the
+    // covers on screen, asked while drawing, are served before these)
+    for (int k = 3; k >= 1; k--) { cat_art(cat, sel - k, 0); cat_art(cat, sel + k, 0); }
+
+    cf_cover cv_[10];
+    int cnt = 0, c0 = (int)floorf(cf_pos);
+    for (int i = c0 - 3; i <= c0 + 4 && cnt < 10; i++)
+        if (i >= 0 && i < n && fabsf(i - cf_pos) < 3) { cv_[cnt].i = i; cf_slot(i - cf_pos, &cv_[cnt]); cnt++; }
+    // draw order: farthest first, so nearer covers overlap them
+    for (int a = 0; a < cnt; a++)
+        for (int b = a + 1; b < cnt; b++)
+            if (fabsf(cv_[b].i - cf_pos) > fabsf(cv_[a].i - cf_pos)) { cf_cover t = cv_[a]; cv_[a] = cv_[b]; cv_[b] = t; }
+    // columns of each cover not under an opaque nearer one (its rounded
+    // corners excepted, so they blend over what's behind)
+    for (int a = 0; a < cnt; a++) {
+        int l = cv_[a].x, r = cv_[a].x + cv_[a].w;
+        for (int pass = 0; pass < 2; pass++)
+            for (int b = a + 1; b < cnt; b++) {
+                if (cv_[b].alpha < 255) continue;
+                int ol = cv_[b].x + CF_R + 1, orr = cv_[b].x + cv_[b].w - CF_R - 1;
+                if (ol <= l && orr > l) l = orr;
+                if (ol < r && orr >= r) r = ol;
+            }
+        cv_[a].vx0 = l; cv_[a].vx1 = r;
+    }
+
+    // backdrop, rows 36..507, only where no opaque cover will be drawn
+    uint64_t now = plat_time_us();
+    int t = 256;
+    if (cf_fading(now)) {
+        float f = (now - cf_bd_t0) / (float)CF_FADE_US;
+        t = (int)(256 * f * f * (3 - 2 * f)); // smoothstep
+    }
+    const image *ba = t < 256 ? &cf_bd_a : NULL, *bb = &cf_bd_b;
+    for (int y = 36; y < 508; y++) {
+        int iv[10][2], m = 0;
+        for (int k = 0; k < cnt; k++) {
+            cf_cover *c = &cv_[k];
+            if (c->alpha < 255 || y < c->y || y >= c->y + c->h) continue;
+            int in = y > c->y + CF_R && y < c->y + c->h - 1 - CF_R ? 0 : CF_R + 1; // corner rows: inner part only
+            iv[m][0] = c->x + in; iv[m][1] = c->x + c->w - in; m++;
+        }
+        for (int a = 0; a < m; a++) // sort by start
+            for (int b = a + 1; b < m; b++)
+                if (iv[b][0] < iv[a][0]) { int t0 = iv[a][0], t1 = iv[a][1]; iv[a][0] = iv[b][0]; iv[a][1] = iv[b][1]; iv[b][0] = t0; iv[b][1] = t1; }
+        int x = 0;
+        for (int a = 0; a < m; a++) {
+            if (iv[a][0] > x) gfx_crossfade_span(&cv, ba, bb, t, y, x, iv[a][0]);
+            if (iv[a][1] > x) x = iv[a][1];
+        }
+        if (x < SCREEN_W) gfx_crossfade_span(&cv, ba, bb, t, y, x, SCREEN_W);
+    }
+
+    for (int k = 0; k < cnt; k++) {
+        cf_cover *c = &cv_[k];
+        if (c->vx1 <= c->vx0) continue;
+        const image *img = cat_art(cat, c->i, c->w);
+        if (img) { gfx_cover(&cv, img, c->x, c->y, c->w, c->h, CF_R, c->shade, c->alpha, c->vx0, c->vx1); continue; }
+        // until the art arrives: the thumbnail (smooth, it's small) or a placeholder
+        gfx_clip(&cv, c->vx0, 0, c->vx1 - c->vx0, SCREEN_H);
+        const image *th = cat_thumb(cat, c->i, 48);
+        if (th) gfx_image_scaled(&cv, th, c->x, c->y, c->w, c->h, CF_R, c->shade, c->alpha, 1);
+        else gfx_rrect(&cv, c->x, c->y, c->w, c->h, CF_R, WITH_ALPHA(col_mix(RGB(0, 0, 0), C_PLACEH, c->shade / 255.0f), c->alpha));
+        gfx_noclip(&cv);
+    }
+
+    // details of the album in (or heading to) the centre; pills beside the
+    // title as in Figma, or on the artist line when the title is long
+    const cat_album *al = &cat->albums[sel];
+    const cat_track *tr = &cat->tracks[al->tracks[0]];
+    char q[40];
+    fmt_quality(q, sizeof q, tr->fmt, tr->bits, tr->rate);
+    const char *p[2] = { format_label(tr->fmt), q };
+    float pw = pill_w(p[0]) + 8 + pill_w(p[1]);
+    int low = text_width(FONT_GEIST_MEDIUM, 24, al->title) > 644 - 12 - pw - 312;
+    float pl = pills_right(644, low ? 467 : 435, p, 2);
+    text_at(FONT_GEIST_MEDIUM, 24, 0, 312, 429, al->title, C_TEXT, low ? 644 - 312 : (int)(pl - 12 - 312));
+    text_at(FONT_GEIST, 16, 0, 312, 467, al->artist, C_TEXT2, (int)(low ? pl - 12 - 312 : 644 - 312));
+
+    hot(0, 52, SCREEN_W, 400, -1, Z_COVERS, 0);
+    gfx_rect(&cv, 0, 0, SCREEN_W, 36, RGB(0, 0, 0)); // the top bar is black here
+
+    // frame timing while animating, logged when it comes to rest
+    float ms = (plat_time_us() - t_start) / 1000.0f;
+    if (cf_moving() || cf_fading(now)) {
+        if (!cf_perf.frames) cf_perf.t0 = t_start;
+        cf_perf.frames++;
+        cf_perf.draw_ms += ms;
+        if (ms > cf_perf.draw_max) cf_perf.draw_max = ms;
+        cf_perf.last = t_start;
+    } else if (cf_perf.frames) {
+        if (cf_perf.frames >= 10 && cf_perf.last > cf_perf.t0)
+            plat_log("coverflow: %d frames, %.1f fps, draw %.1f ms avg %.1f max", cf_perf.frames,
+                     (cf_perf.frames - 1) * 1e6f / (cf_perf.last - cf_perf.t0), cf_perf.draw_ms / cf_perf.frames, cf_perf.draw_max);
+        memset(&cf_perf, 0, sizeof cf_perf);
+    }
+}
+
+// one animation tick: ease the position towards the selection, run the
+// backdrop fade, keep the clock up while anything moves
 static void cf_step(void) {
     uint64_t now = plat_time_us();
     float dt = cf_last ? (now - cf_last) / 1e6f : 0;
     cf_last = now;
-    if (!coverflow() || (tc.down && tc.z.kind == Z_COVERS)) return;
+    if (!coverflow()) { cf_boost(0); return; }
     int n = cat->nalbums;
     list_t *l = &lst_tab[TAB_ALBUMS];
     if (l->sel >= n) l->sel = n - 1;
     if (l->sel < 0) l->sel = 0;
-    float target = (float)l->sel, d = target - cf_pos;
-    if (fabsf(d) > 6) cf_pos = target - (d > 0 ? 6 : -6); // long jumps: skip ahead
-    if (dt > 0.1f) dt = 0.1f;
-    cf_pos += (target - cf_pos) * (1 - expf(-dt * 11));
-    if (fabsf(target - cf_pos) < 0.002f) cf_pos = target;
-    else dirty = 1;
+    cf_backdrop_step(now);
+    if (cf_fading(now)) dirty = 1;
+    if (!(tc.down && tc.z.kind == Z_COVERS)) {
+        float target = (float)l->sel, d = target - cf_pos;
+        if (fabsf(d) > 6) cf_pos = target - (d > 0 ? 6 : -6); // long jumps: skip ahead
+        if (dt > 0.1f) dt = 0.1f;
+        cf_pos += (target - cf_pos) * (1 - expf(-dt * 11));
+        if (fabsf(target - cf_pos) < 0.002f) cf_pos = target;
+        else dirty = 1;
+    }
+    cf_boost(cf_moving() || cf_fading(now) || (tc.down && tc.z.kind == Z_COVERS));
 }
 
 static void draw_library(const player_status *s) {
-    gfx_clear(&cv, RGB(0, 0, 0));
+    if (!coverflow()) gfx_clear(&cv, RGB(0, 0, 0)); // cover flow fills every pixel itself
     int empty = !cat || !cat->ntracks;
     if (coverflow()) {
         draw_coverflow();
@@ -1110,6 +1187,8 @@ static uint32_t handle_touch(const player_status *s) {
             if (cf_pos > cat->nalbums - 0.6f) cf_pos = cat->nalbums - 0.6f;
             if (dt > 0) cf_vel = cf_vel * 0.6f + (cf_pos - before) / dt * 0.4f;
             tc.t_move = now;
+            int c = (int)lroundf(cf_pos); // title and backdrop follow the centre cover
+            lst_tab[TAB_ALBUMS].sel = c < 0 ? 0 : c >= cat->nalbums ? cat->nalbums - 1 : c;
         }
         if (x != tc.x || y != tc.y) dirty = 1;
         tc.x = x; tc.y = y;
@@ -1349,6 +1428,7 @@ int app_init(const char *asset_dir) {
 void app_force_redraw(void) { dirty = 1; np_static_dirty = mini_dirty = 1; }
 
 static void lock_screen(void) {
+    cf_boost(0); // app_step stops early while locked
     screen_off = 1;
     wake_armed = 0;
     wake_hold = 0;

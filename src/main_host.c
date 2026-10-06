@@ -167,8 +167,10 @@ int main(int argc, char **argv) {
         run_ms(1500);              // settle + art + backdrop
         shot("c01_coverflow");
         tap(BTN_RIGHT);
-        run_ms(90);
+        run_ms(40);
         shot("c02_moving");
+        run_ms(250);               // backdrop asked for after 150 ms, then fades in
+        shot("c02b_fading");
         run_ms(1500);
         shot("c03_second");
         drag(700, 250, 300, 250, 150, 0); // flick left -> forward several

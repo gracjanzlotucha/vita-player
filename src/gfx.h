@@ -28,6 +28,14 @@ void gfx_triangle_outline(canvas *c, float x0, float y0, float x1, float y1, flo
 void gfx_image(canvas *c, const image *img, int x, int y, float radius, uint8_t alpha);
 void gfx_blit(canvas *c, const image *img, int x, int y); // opaque copy, no blending
 void gfx_image_scaled(canvas *c, const image *img, int x, int y, int w, int h, float r, int shade, int alpha, int smooth);
+// Cover Flow cover: nearest from an image already near w x h, colour * shade/255,
+// faded by alpha, corners r; only columns [vx0, vx1) are drawn.
+void gfx_cover(canvas *c, const image *img, int x, int y, int w, int h, int r, int shade, int alpha, int vx0, int vx1);
+// Row y, columns [x0, x1) of two full-screen images cross-faded (t 0 = a, 256 = b);
+// a NULL or empty image is black.
+void gfx_crossfade_span(canvas *c, const image *a, const image *b, int t, int y, int x0, int x1);
+// Box-filtered downscale into a new w x h image (thread-safe). 0 on success.
+int  image_downscale(const image *src, image *out, int w, int h);
 // Blurred cover background (Figma "Background" layer): the cover in the rect
 // (fx, fy, fw, fh) of a new ow x oh image, saturated, blurred, at `opacity`
 // over black. Returns 0 on success.

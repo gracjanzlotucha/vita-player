@@ -451,23 +451,26 @@ static int load_art(uint32_t key, const char *path, image *out) {
 // UI side: a small LRU of decoded covers, owned by the UI thread (so the
 // images it draws are never freed under it). The worker only fills a mailbox.
 #define ART_SLOTS 16
-static struct { uint32_t key; int state; image img; uint64_t used; } art[ART_SLOTS]; // state: 0 retry, 1 asked, 2 ready, 3 none
+static const int art_size[CAT_ART_LEVELS] = { CAT_ART, 304, 251 }; // the Cover Flow keyframe sizes
+static struct { uint32_t key; int state; image lv[CAT_ART_LEVELS]; uint64_t used; } art[ART_SLOTS]; // state: 0 retry, 1 asked, 2 ready, 3 none
 static uint64_t art_clock;
 #define AQ 8
 static struct { uint32_t key; char path[1024]; } aq[AQ]; // requests (cm), newest last
 static int aqn;
-static struct { uint32_t key; image img; int ok; } ares[AQ]; // results (cm)
+static struct { uint32_t key; image lv[CAT_ART_LEVELS]; int ok; } ares[AQ]; // results (cm)
 static int aresn;
 
-const image *cat_art(const catalog *c, int album) {
+static void art_free(image *lv) { for (int i = 0; i < CAT_ART_LEVELS; i++) image_free(&lv[i]); }
+
+const image *cat_art(const catalog *c, int album, int size) {
     if (!c || album < 0 || album >= c->nalbums) return NULL;
     uint32_t key = c->albums[album].key;
     plat_mutex_lock(cm);
     for (int i = 0; i < aresn; i++) { // collect finished covers
         int s = -1;
         for (int k = 0; k < ART_SLOTS; k++) if (art[k].key == ares[i].key && art[k].state == 1) { s = k; break; }
-        if (s >= 0) { art[s].img = ares[i].img; art[s].state = ares[i].ok ? 2 : 3; }
-        else image_free(&ares[i].img);
+        if (s >= 0) { memcpy(art[s].lv, ares[i].lv, sizeof art[s].lv); art[s].state = ares[i].ok ? 2 : 3; }
+        else art_free(ares[i].lv);
     }
     aresn = 0;
     int s = -1;
@@ -475,7 +478,7 @@ const image *cat_art(const catalog *c, int album) {
     if (s < 0) { // take an empty or the least recently used slot
         s = 0;
         for (int k = 1; k < ART_SLOTS; k++) if (art[k].used < art[s].used) s = k;
-        image_free(&art[s].img);
+        art_free(art[s].lv);
         art[s].key = key;
         art[s].state = 0;
     }
@@ -491,7 +494,12 @@ const image *cat_art(const catalog *c, int album) {
         aqn++;
         art[s].state = 1;
     }
-    const image *out = art[s].state == 2 ? &art[s].img : NULL;
+    const image *out = NULL;
+    if (art[s].state == 2) { // the smallest level at least `size` wide
+        int l = CAT_ART_LEVELS - 1;
+        while (l > 0 && (art[s].lv[l].w < size || !art[s].lv[l].px)) l--;
+        out = art[s].lv[l].px ? &art[s].lv[l] : NULL;
+    }
     plat_mutex_unlock(cm);
     return out;
 }
@@ -504,40 +512,44 @@ static int service_art(void) {
     char path[1024];
     snprintf(path, sizeof path, "%s", aq[aqn].path);
     plat_mutex_unlock(cm);
-    image img = { 0 };
-    int ok = load_art(key, path, &img) == 0;
+    image lv[CAT_ART_LEVELS] = { 0 };
+    int ok = load_art(key, path, &lv[0]) == 0;
+    if (ok) { // smaller levels, each from the one above, so drawing is ~1:1
+        plat_cpu_boost(1);
+        for (int i = 1; i < CAT_ART_LEVELS; i++) image_downscale(&lv[i - 1], &lv[i], art_size[i], art_size[i]);
+        plat_cpu_boost(0);
+    }
     plat_mutex_lock(cm);
-    if (aresn < AQ) { ares[aresn].key = key; ares[aresn].img = img; ares[aresn].ok = ok; aresn++; }
-    else image_free(&img);
+    if (aresn < AQ) { ares[aresn].key = key; memcpy(ares[aresn].lv, lv, sizeof lv); ares[aresn].ok = ok; aresn++; }
+    else art_free(lv);
     plat_mutex_unlock(cm);
     return 1;
 }
 
-// One backdrop at a time, same hand-over as cat_cover.
+// One backdrop at a time; the UI takes ownership (it cross-fades between two).
 static uint32_t bd_req_key, bd_new_key; // cm
-static int bd_req;
+static int bd_req, bd_new_ready;
 static char bd_req_path[1024];
 static image bd_new;
-static image bd_cur;                    // UI thread only
-static uint32_t bd_cur_key;
 
-const image *cat_backdrop(const catalog *c, int album) {
-    if (!c || album < 0 || album >= c->nalbums) return NULL;
+int cat_backdrop(const catalog *c, int album, image *out) {
+    if (!c || album < 0 || album >= c->nalbums) return 0;
     uint32_t key = c->albums[album].key;
-    const image *out = bd_cur.px ? &bd_cur : NULL; // keep showing the last one meanwhile
-    if (bd_cur_key == key) return out;
+    int got = 0;
     plat_mutex_lock(cm);
-    if (bd_new_key == key) {
-        image_free(&bd_cur);
-        bd_cur = bd_new; bd_cur_key = key;
-        memset(&bd_new, 0, sizeof bd_new); bd_new_key = 0;
-        out = bd_cur.px ? &bd_cur : NULL;
-    } else if (bd_req_key != key) {
+    if (bd_new_ready && bd_new_key == key) {
+        if (out) {
+            *out = bd_new;
+            memset(&bd_new, 0, sizeof bd_new);
+            bd_new_ready = 0; bd_new_key = 0;
+            got = 1;
+        }
+    } else if (bd_req_key != key) { // (bd_req_key stays set while it is built)
         bd_req_key = key; bd_req = 1;
         snprintf(bd_req_path, sizeof bd_req_path, "%s", c->tracks[c->albums[album].tracks[0]].path);
     }
     plat_mutex_unlock(cm);
-    return out;
+    return got;
 }
 
 static int service_backdrop(void) {
@@ -557,7 +569,8 @@ static int service_backdrop(void) {
     image_free(&cov);
     plat_mutex_lock(cm);
     image_free(&bd_new);
-    bd_new = bg; bd_new_key = key; // no art: empty, so the UI stops asking
+    bd_new = bg; bd_new_key = key; bd_new_ready = 1; // no art: empty (black)
+    if (bd_req_key == key) bd_req_key = 0; // taken or not, ask again next time
     plat_mutex_unlock(cm);
     return 1;
 }
@@ -651,7 +664,7 @@ static void scan(cat_track **known, int *nknown) {
         } else {
             read_track(&out[n++], &files[i]);
             changed = 1;
-            if (!service_cover() && !service_backdrop() && !service_art()) service_thumb(); // keep visible art coming during a long scan
+            if (!service_cover() && !service_art() && !service_backdrop()) service_thumb(); // keep visible art coming during a long scan
             if (plat_time_us() - last_pub > 2000000) { publish(out, n); last_pub = plat_time_us(); }
         }
         plat_mutex_lock(cm);
@@ -687,7 +700,7 @@ static int worker(void *arg) {
             plat_mutex_unlock(cm);
             continue;
         }
-        if (!service_cover() && !service_backdrop() && !service_art() && !service_thumb()) plat_sleep_us(20000);
+        if (!service_cover() && !service_art() && !service_backdrop() && !service_thumb()) plat_sleep_us(20000);
     }
     return 0;
 }
